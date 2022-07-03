@@ -126,6 +126,7 @@ static int x86_64_get_framesize(struct bt_info *, ulong, ulong);
 static void x86_64_framesize_debug(struct bt_info *);
 static void x86_64_get_active_set(void);
 static int x86_64_get_kvaddr_ranges(struct vaddr_range *);
+static int x86_64_get_cpu_reg(int, int, const char *, int, void *);
 static int x86_64_verify_paddr(uint64_t);
 static void GART_init(void);
 static void x86_64_exception_stacks_init(void);
@@ -138,6 +139,9 @@ static ulong ip_table_to_vaddr(ulong);
 static void orc_dump(ulong);
 
 struct machine_specific x86_64_machine_specific = { 0 };
+
+static const char *exception_functions_orig[];
+static const char *exception_functions_5_8[];
 
 /*
  *  Do all necessary machine-specific setup here.  This is called several
@@ -191,6 +195,7 @@ x86_64_init(int when)
 		machdep->machspec->irq_eframe_link = UNINITIALIZED;
 		machdep->machspec->irq_stack_gap = UNINITIALIZED;
 		machdep->get_kvaddr_ranges = x86_64_get_kvaddr_ranges;
+		machdep->get_cpu_reg = x86_64_get_cpu_reg;
                 if (machdep->cmdline_args[0])
                         parse_cmdline_args();
 		if ((string = pc->read_vmcoreinfo("relocate"))) {
@@ -356,18 +361,19 @@ x86_64_init(int when)
 			machdep->machspec->physical_mask_shift = __PHYSICAL_MASK_SHIFT_5LEVEL;
 			machdep->machspec->pgdir_shift = PGDIR_SHIFT_5LEVEL;
 			machdep->machspec->ptrs_per_pgd = PTRS_PER_PGD_5LEVEL;
-			if ((machdep->machspec->p4d = (char *)malloc(PAGESIZE())) == NULL)
-				error(FATAL, "cannot malloc p4d space.");
-			machdep->machspec->last_p4d_read = 0;
+			if (!machdep->machspec->p4d) {
+				if ((machdep->machspec->p4d = (char *)malloc(PAGESIZE())) == NULL)
+					error(FATAL, "cannot malloc p4d space.");
+				machdep->machspec->last_p4d_read = 0;
+			}
 			machdep->uvtop = x86_64_uvtop_level4;  /* 5-level is optional per-task */
 			machdep->kvbase = (ulong)PAGE_OFFSET;
 			machdep->identity_map_base = (ulong)PAGE_OFFSET;
 		}
 
 		/*
-		 *  Check for CONFIG_RANDOMIZE_MEMORY, and set page_offset here.
-		 *  The remainder of the virtual address range setups will get
-		 *  done below in POST_GDB.
+		 *  Check for CONFIG_RANDOMIZE_MEMORY, and set page_offset and
+		 *  the virtual address ranges.
 		 */
 		if (kernel_symbol_exists("page_offset_base") &&
 		    kernel_symbol_exists("vmalloc_base")) {
@@ -377,12 +383,37 @@ x86_64_init(int when)
 				"page_offset_base", QUIET|FAULT_ON_ERROR);
 			machdep->kvbase = machdep->machspec->page_offset;
 			machdep->identity_map_base = machdep->machspec->page_offset;
+
+			readmem(symbol_value("vmalloc_base"), KVADDR,
+					&machdep->machspec->vmalloc_start_addr,
+					sizeof(ulong), "vmalloc_base", FAULT_ON_ERROR);
+			if (machdep->flags & VM_5LEVEL)
+				machdep->machspec->vmalloc_end =
+					machdep->machspec->vmalloc_start_addr + TERABYTES(1280) - 1;
+			else
+				machdep->machspec->vmalloc_end =
+					machdep->machspec->vmalloc_start_addr + TERABYTES(32) - 1;
+			if (kernel_symbol_exists("vmemmap_base")) {
+				readmem(symbol_value("vmemmap_base"), KVADDR,
+					&machdep->machspec->vmemmap_vaddr, sizeof(ulong),
+					"vmemmap_base", FAULT_ON_ERROR);
+				machdep->machspec->vmemmap_end =
+					machdep->machspec->vmemmap_vaddr +
+					TERABYTES(1) - 1;
+			} else {
+				machdep->machspec->vmemmap_vaddr = VMEMMAP_VADDR_2_6_31;
+				machdep->machspec->vmemmap_end = VMEMMAP_END_2_6_31;
+			}
+			machdep->machspec->modules_vaddr = __START_KERNEL_map +
+				(machdep->machspec->kernel_image_size ?
+				machdep->machspec->kernel_image_size : GIGABYTES(1));
+			machdep->machspec->modules_end = MODULES_END_2_6_31;
 		}
 		break;
 
 	case POST_GDB:
 		if (!(machdep->flags & RANDOMIZED) &&
-		    ((THIS_KERNEL_VERSION >= LINUX(4,20,0)) || 
+		    ((THIS_KERNEL_VERSION >= LINUX(4,19,5)) || 
 		    ((THIS_KERNEL_VERSION >= LINUX(4,14,84)) && 
 		     (THIS_KERNEL_VERSION < LINUX(4,15,0))))) {
 			machdep->machspec->page_offset = machdep->flags & VM_5LEVEL ?
@@ -407,32 +438,7 @@ x86_64_init(int when)
 			machdep->machspec->modules_end = MODULES_END_2_6_27;
 		}
 		if (THIS_KERNEL_VERSION >= LINUX(2,6,31)) {
-			if (machdep->flags & RANDOMIZED) {
-				readmem(symbol_value("vmalloc_base"), KVADDR,
-					&machdep->machspec->vmalloc_start_addr,
-					sizeof(ulong), "vmalloc_base", FAULT_ON_ERROR);
-				if (machdep->flags & VM_5LEVEL)
-					machdep->machspec->vmalloc_end =
-						machdep->machspec->vmalloc_start_addr + TERABYTES(1280) - 1;
-				else
-					machdep->machspec->vmalloc_end =
-						machdep->machspec->vmalloc_start_addr + TERABYTES(32) - 1;
-				if (kernel_symbol_exists("vmemmap_base")) {
-					readmem(symbol_value("vmemmap_base"), KVADDR,
-						&machdep->machspec->vmemmap_vaddr, sizeof(ulong),
-						"vmemmap_base", FAULT_ON_ERROR);
-					machdep->machspec->vmemmap_end = 
-						machdep->machspec->vmemmap_vaddr +
-						TERABYTES(1) - 1;
-				} else {
-					machdep->machspec->vmemmap_vaddr = VMEMMAP_VADDR_2_6_31;
-					machdep->machspec->vmemmap_end = VMEMMAP_END_2_6_31;
-				}
-				machdep->machspec->modules_vaddr = __START_KERNEL_map + 
-					(machdep->machspec->kernel_image_size ?
-					machdep->machspec->kernel_image_size : GIGABYTES(1));
-				machdep->machspec->modules_end = MODULES_END_2_6_31;
-			} else {
+			if (!(machdep->flags & RANDOMIZED)) {
 				machdep->machspec->vmalloc_start_addr = VMALLOC_START_ADDR_2_6_31;
 				machdep->machspec->vmalloc_end = VMALLOC_END_2_6_31;
 				machdep->machspec->vmemmap_vaddr = VMEMMAP_VADDR_2_6_31;
@@ -665,7 +671,10 @@ x86_64_init(int when)
 		}
 		machdep->section_size_bits = _SECTION_SIZE_BITS;
 		if (!machdep->max_physmem_bits) {
-			if (machdep->flags & VM_5LEVEL)
+			if ((string = pc->read_vmcoreinfo("NUMBER(MAX_PHYSMEM_BITS)"))) {
+				machdep->max_physmem_bits = atol(string);
+				free(string);
+			} else if (machdep->flags & VM_5LEVEL)
 				machdep->max_physmem_bits = 
 					_MAX_PHYSMEM_BITS_5LEVEL;
 			else if (THIS_KERNEL_VERSION >= LINUX(2,6,31))
@@ -730,6 +739,12 @@ x86_64_init(int when)
 		STRUCT_SIZE_INIT(percpu_data, "percpu_data");
 
 		GART_init();
+
+		if (kernel_symbol_exists("asm_exc_divide_error"))
+			machdep->machspec->exception_functions = (char **)exception_functions_5_8;
+		else
+			machdep->machspec->exception_functions = (char **)exception_functions_orig;
+
 		break;
 
 	case POST_VM:
@@ -870,6 +885,7 @@ x86_64_dump_machdep_table(ulong arg)
         fprintf(fp, "        is_page_ptr: x86_64_is_page_ptr()\n");
         fprintf(fp, "       verify_paddr: x86_64_verify_paddr()\n");
         fprintf(fp, "  get_kvaddr_ranges: x86_64_get_kvaddr_ranges()\n");
+	fprintf(fp, "        get_cpu_reg: x86_64_get_cpu_reg()\n");
         fprintf(fp, "    init_kernel_pgd: x86_64_init_kernel_pgd()\n");
         fprintf(fp, "clear_machdep_cache: x86_64_clear_machdep_cache()\n");
 	fprintf(fp, " xendump_p2m_create: %s\n", PVOPS_XEN() ?
@@ -1099,6 +1115,12 @@ x86_64_dump_machdep_table(ulong arg)
 		fprintf(fp, "%016lx\n", (ulong)ms->cpu_entry_area_end);
 	else
 		fprintf(fp, "(unused)\n");
+
+	fprintf(fp, "      excpetion_functions: ");
+	if (ms->exception_functions == (char **)exception_functions_5_8)
+		fprintf(fp, "excpetion_functions_5_8\n");
+	else
+		fprintf(fp, "excpetion_functions_orig\n");
 }
 
 /*
@@ -1265,6 +1287,7 @@ x86_64_per_cpu_init(void)
 	struct machine_specific *ms;
 	struct syment *irq_sp, *curr_sp, *cpu_sp, *hardirq_stack_ptr_sp;
 	ulong hardirq_stack_ptr;
+	ulong __per_cpu_load = 0;
 
 	ms = machdep->machspec;
 
@@ -1306,7 +1329,12 @@ x86_64_per_cpu_init(void)
 	else if (!ms->stkinfo.isize)
 		ms->stkinfo.isize = 16384;
 
+	if (kernel_symbol_exists("__per_cpu_load"))
+		__per_cpu_load = symbol_value("__per_cpu_load");
+
 	for (i = cpus = 0; i < NR_CPUS; i++) {
+		if (__per_cpu_load && kt->__per_cpu_offset[i] == __per_cpu_load)
+			break;
 		if (!readmem(cpu_sp->value + kt->__per_cpu_offset[i],
 		    KVADDR, &cpunumber, sizeof(int),
 		    "cpu number (per_cpu)", QUIET|RETURN_ON_ERROR))
@@ -1321,6 +1349,8 @@ x86_64_per_cpu_init(void)
 		    	    KVADDR, &hardirq_stack_ptr, sizeof(void *),
 		    	    "hardirq_stack_ptr (per_cpu)", QUIET|RETURN_ON_ERROR))
 				continue;
+			if (hardirq_stack_ptr != PAGEBASE(hardirq_stack_ptr))
+				hardirq_stack_ptr += 8;
 			ms->stkinfo.ibase[i] = hardirq_stack_ptr - ms->stkinfo.isize;
 		} else if (irq_sp)
 			ms->stkinfo.ibase[i] = irq_sp->value + kt->__per_cpu_offset[i];
@@ -1364,6 +1394,7 @@ x86_64_ist_init(void)
 	ulong init_tss;
 	struct machine_specific *ms;
 	struct syment *boot_sp, *tss_sp, *ist_sp;
+	char *exc_stack_struct_name = NULL;
 
         ms = machdep->machspec;
 	if (!(tss_sp = per_cpu_symbol_search("per_cpu__init_tss"))) {
@@ -1439,25 +1470,40 @@ x86_64_ist_init(void)
 		return;
 	}
 
-	if (MEMBER_EXISTS("exception_stacks", "NMI_stack")) {
+	if (MEMBER_EXISTS("cea_exception_stacks", "NMI_stack")) {
+		/* The effective cpu entry area mapping with guard pages. */
+		exc_stack_struct_name = "cea_exception_stacks";
+	} else if (MEMBER_EXISTS("exception_stacks", "NMI_stack")) {
+		/* The exception stacks' physical storage. No guard pages and no VC stack. */
+		exc_stack_struct_name = "exception_stacks";
+	}
+	if (exc_stack_struct_name) {
                 for (i = 0; i < MAX_EXCEPTION_STACKS; i++) {
 			if (STREQ(ms->stkinfo.exception_stacks[i], "DEBUG"))
-				ms->stkinfo.esize[i] = MEMBER_SIZE("exception_stacks", "DB_stack");
+				ms->stkinfo.esize[i] = MEMBER_SIZE(exc_stack_struct_name, "DB_stack");
 			else if (STREQ(ms->stkinfo.exception_stacks[i], "NMI"))
-				ms->stkinfo.esize[i] = MEMBER_SIZE("exception_stacks", "NMI_stack");
+				ms->stkinfo.esize[i] = MEMBER_SIZE(exc_stack_struct_name, "NMI_stack");
 			else if (STREQ(ms->stkinfo.exception_stacks[i], "DOUBLEFAULT"))
-				ms->stkinfo.esize[i] = MEMBER_SIZE("exception_stacks", "DF_stack");
+				ms->stkinfo.esize[i] = MEMBER_SIZE(exc_stack_struct_name, "DF_stack");
 			else if (STREQ(ms->stkinfo.exception_stacks[i], "MCE"))
-				ms->stkinfo.esize[i] = MEMBER_SIZE("exception_stacks", "MCE_stack");
+				ms->stkinfo.esize[i] = MEMBER_SIZE(exc_stack_struct_name, "MCE_stack");
+			else if (STREQ(ms->stkinfo.exception_stacks[i], "VC"))
+				ms->stkinfo.esize[i] = MEMBER_SIZE(exc_stack_struct_name, "VC_stack");
 		}
 		/*
-	 	 *  Adjust the top-of-stack addresses down to the base stack address.
+		 *  Adjust the top-of-stack addresses down to the base stack address
+		 *  and set stack page availabilituy flag.
 		 */
 		for (c = 0; c < kt->cpus; c++) {
 			for (i = 0; i < MAX_EXCEPTION_STACKS; i++) {
-				if (ms->stkinfo.ebase[c][i] == 0) 
-					continue;
-				ms->stkinfo.ebase[c][i] -= ms->stkinfo.esize[i];
+				if (ms->stkinfo.ebase[c][i])
+					ms->stkinfo.ebase[c][i] -= ms->stkinfo.esize[i];
+
+				ms->stkinfo.available[c][i] = TRUE;
+				/* VC stack can be unmapped if SEV-ES is disabled or not supported. */
+				if (STREQ(ms->stkinfo.exception_stacks[i], "VC") &&
+				    !accessible(ms->stkinfo.ebase[c][i]))
+					ms->stkinfo.available[c][i] = FALSE;
 			}
 		}
 
@@ -1482,6 +1528,7 @@ x86_64_ist_init(void)
 			else
 				ms->stkinfo.esize[i] = esize;
 			ms->stkinfo.ebase[c][i] -= ms->stkinfo.esize[i];
+			ms->stkinfo.available[c][i] = TRUE;
 		}
 	}
 
@@ -2017,6 +2064,19 @@ x86_64_uvtop_level4(struct task_context *tc, ulong uvaddr, physaddr_t *paddr, in
 	if (!(pud_pte & _PAGE_PRESENT))
 		goto no_upage;
 
+	if (pud_pte & _PAGE_PSE) {
+		if (verbose) {
+			fprintf(fp, "  PAGE: %lx  (1GB)\n\n",
+			       PAGEBASE(pud_pte) & PHYSICAL_PAGE_MASK);
+			x86_64_translate_pte(pud_pte, 0, 0);
+		}
+
+		physpage = (PAGEBASE(pud_pte) & PHYSICAL_PAGE_MASK) +
+			       (uvaddr & ~_1GB_PAGE_MASK);
+		*paddr = physpage;
+		return TRUE;
+	}
+
 	/*
          *  pmd = pmd_offset(pud, address);
 	 */
@@ -2426,6 +2486,19 @@ start_vtop_with_pagetable:
 	if (!(pud_pte & _PAGE_PRESENT))
 		goto no_kpage;
 
+	if (pud_pte & _PAGE_PSE) {
+		if (verbose) {
+			fprintf(fp, "  PAGE: %lx  (1GB)\n\n",
+			       PAGEBASE(pud_pte) & PHYSICAL_PAGE_MASK);
+			x86_64_translate_pte(pud_pte, 0, 0);
+		}
+
+		physpage = (PAGEBASE(pud_pte) & PHYSICAL_PAGE_MASK) +
+			       (kvaddr & ~_1GB_PAGE_MASK);
+		*paddr = physpage;
+		return TRUE;
+	}
+
 	/*
          *  pmd = pmd_offset(pud, address);
 	 */
@@ -2811,7 +2884,8 @@ x86_64_eframe_search(struct bt_info *bt)
 			    !(NUM_IN_BITMAP(bt->cpumask, c)))
 				continue;
                 	for (i = 0; i < MAX_EXCEPTION_STACKS; i++) {
-                        	if (ms->stkinfo.ebase[c][i] == 0)
+				if (ms->stkinfo.ebase[c][i] == 0 ||
+				    !ms->stkinfo.available[c][i])
                                 	break;
                                 bt->hp->esp = ms->stkinfo.ebase[c][i];
                                 fprintf(fp, "CPU %d %s EXCEPTION STACK:",
@@ -3035,7 +3109,7 @@ text_lock_function(char *name, struct bt_info *bt, ulong locktext)
  * zeroentry xen_debug do_debug
  * zeroentry xen_int3 do_int3
 */
-static const char *exception_functions[] = {
+static const char *exception_functions_orig[] = {
 	"invalid_TSS",
 	"segment_not_present",
 	"alignment_check",
@@ -3055,6 +3129,28 @@ static const char *exception_functions[] = {
 	"xen_debug",
 	"xen_int3",
 	"async_page_fault",
+	NULL,
+};
+
+static const char *exception_functions_5_8[] = {
+	"asm_exc_invalid_tss",
+	"asm_exc_segment_not_present",
+	"asm_exc_alignment_check",
+	"asm_exc_general_protection",
+	"asm_exc_page_fault",
+	"asm_exc_divide_error",
+	"asm_exc_overflow",
+	"asm_exc_bounds",
+	"asm_exc_invalid_op",
+	"asm_exc_device_not_available",
+	"asm_exc_coproc_segment_overrun",
+	"asm_exc_spurious_interrupt_bug",
+	"asm_exc_coprocessor_error",
+	"asm_exc_simd_coprocessor_error",
+	"asm_exc_debug",
+	"xen_asm_exc_stack_segment",
+	"xen_asm_exc_xen_hypervisor_callback",
+	"xen_asm_exc_int3",
 	NULL,
 };
 
@@ -3134,8 +3230,8 @@ x86_64_print_stack_entry(struct bt_info *bt, FILE *ofp, int level,
 	if ((THIS_KERNEL_VERSION >= LINUX(2,6,29)) && 
 	    (eframe_check == -1) && offset && 
 	    !(bt->flags & (BT_EXCEPTION_FRAME|BT_START|BT_SCHEDULE))) { 
-		for (i = 0; exception_functions[i]; i++) {
-			if (STREQ(name, exception_functions[i])) {
+		for (i = 0; machdep->machspec->exception_functions[i]; i++) {
+			if (STREQ(name, machdep->machspec->exception_functions[i])) {
 				eframe_check = 8;
 				break;
 			}
@@ -3257,7 +3353,8 @@ x86_64_in_exception_stack(struct bt_info *bt, int *estack_index)
 
         for (c = 0; !estack && (c < kt->cpus); c++) {
 		for (i = 0; i < MAX_EXCEPTION_STACKS; i++) {
-			if (ms->stkinfo.ebase[c][i] == 0)
+			if (ms->stkinfo.ebase[c][i] == 0 ||
+			    !ms->stkinfo.available[c][i])
 				break;
 			if ((rsp >= ms->stkinfo.ebase[c][i]) &&
 			    (rsp < (ms->stkinfo.ebase[c][i] + 
@@ -4320,7 +4417,7 @@ x86_64_function_called_by(ulong rip)
 	if (gdb_pass_through(buf, pc->tmpfile2, GNU_RETURN_ON_ERROR)) {
 	        rewind(pc->tmpfile2);
 	        while (fgets(buf, BUFSIZE, pc->tmpfile2)) {
-			if ((p1 = strstr(buf, "callq")) &&
+			if ((p1 = strstr(buf, "call")) &&
 			    whitespace(*(p1-1))) { 
 				if (extract_hex(p1, &value, NULLCHAR, TRUE)) 
 					break;
@@ -4383,15 +4480,20 @@ x86_64_exception_frame(ulong flags, ulong kvaddr, char *local,
         long r8, r9, r10, r11, r12, r13, r14, r15;
 	struct machine_specific *ms;
 	struct syment *sp;
-	ulong offset;
+	ulong offset, verify_addr;
 	char *pt_regs_buf;
 	long verified;
 	long err;
 	char buf[BUFSIZE];
 
-	if (flags == EFRAME_VERIFY) {
-		if (!accessible(kvaddr) || 
-		    !accessible(kvaddr + SIZE(pt_regs) - sizeof(long)))
+	if (flags & EFRAME_VERIFY) {
+		if (kvaddr)
+			verify_addr = kvaddr;
+		else
+			verify_addr = (local - bt->stackbuf) + bt->stackbase;
+
+		if (!accessible(verify_addr) ||
+		    !accessible(verify_addr + SIZE(pt_regs) - sizeof(long)))
 			return FALSE;
 	}
 
@@ -4816,6 +4918,9 @@ x86_64_get_stack_frame(struct bt_info *bt, ulong *pcp, ulong *spp)
 	if (bt->flags & BT_DUMPFILE_SEARCH)
 		return x86_64_get_dumpfile_stack_frame(bt, pcp, spp);
 
+	if (bt->flags & BT_SKIP_IDLE)
+		bt->flags &= ~BT_SKIP_IDLE;
+
         if (pcp)
                 *pcp = x86_64_get_pc(bt);
         if (spp)
@@ -4857,6 +4962,9 @@ x86_64_get_dumpfile_stack_frame(struct bt_info *bt_in, ulong *rip, ulong *rsp)
 	in_nmi_stack = stage = 0;
 	estack = -1;
 	panic = FALSE;
+
+	if (bt_in->flags & BT_SKIP_IDLE)
+		bt_in->flags &= ~BT_SKIP_IDLE;
 
 	panic_task = tt->panic_task == bt->task ? TRUE : FALSE;
 
@@ -4996,6 +5104,8 @@ next_sysrq:
                 if (!panic_task && STREQ(sym, "crash_nmi_callback")) {
                         *rip = *up;
                         *rsp = bt->stackbase + ((char *)(up) - bt->stackbuf);
+			if ((bt->flags & BT_SKIP_IDLE) && is_idle_thread(bt->task))
+				bt_in->flags |= BT_SKIP_IDLE;
                         return;
                 }
 
@@ -5061,7 +5171,7 @@ skip_stage:
                 	ms->stkinfo.esize[estack];
 		console("x86_64_get_dumpfile_stack_frame: searching %s estack at %lx\n", 
 			ms->stkinfo.exception_stacks[estack], bt->stackbase);
-		if (!(bt->stackbase)) 
+		if (!(bt->stackbase && ms->stkinfo.available[bt->tc->processor][estack]))
 			goto skip_stage;
 		bt->stackbuf = ms->irqstack;
 		alter_stackbuf(bt);
@@ -5344,6 +5454,8 @@ x86_64_exception_stacks_init(void)
 				ms->stkinfo.exception_stacks[ist-1] = "DOUBLEFAULT";
 			if (strstr(buf, "machine"))
 				ms->stkinfo.exception_stacks[ist-1] = "MCE";
+			if (strstr(buf, "vmm"))
+				ms->stkinfo.exception_stacks[ist-1] = "VC";
 		}
 	}
 
@@ -5499,14 +5611,18 @@ x86_64_get_smp_cpus(void)
 	char *cpu_pda_buf;
 	ulong level4_pgt, cpu_pda_addr;
 	struct syment *sp;
+	ulong __per_cpu_load = 0;
 
 	if (!VALID_STRUCT(x8664_pda)) {
 		if (!(sp = per_cpu_symbol_search("per_cpu__cpu_number")) ||
 		    !(kt->flags & PER_CPU_OFF))
 			return 1;
 
+		if (kernel_symbol_exists("__per_cpu_load"))
+			__per_cpu_load = symbol_value("__per_cpu_load");
+
 		for (i = cpus = 0; i < NR_CPUS; i++) {
-			if (kt->__per_cpu_offset[i] == 0)
+			if (__per_cpu_load && kt->__per_cpu_offset[i] == __per_cpu_load)
 				break;
 			if (!readmem(sp->value + kt->__per_cpu_offset[i], 
 			    KVADDR, &cpunumber, sizeof(int),
@@ -5700,6 +5816,9 @@ x86_64_display_machine_stats(void)
 
 			fprintf(fp, "%22s: %016lx",
 				buf, machdep->machspec->stkinfo.ebase[c][i]);
+
+			if (!machdep->machspec->stkinfo.available[c][i])
+				fprintf(fp, " [unavailable]");
 
 			if (hide_offline_cpu(c))
 				fprintf(fp, " [OFFLINE]\n");
@@ -6272,11 +6391,13 @@ search_for_switch_to(ulong start, ulong end)
 	char search_string1[BUFSIZE];
 	char search_string2[BUFSIZE];
 	char search_string3[BUFSIZE];
+	char search_string4[BUFSIZE];
 	int found;
 
 	max_instructions = end - start;
 	found = FALSE;
-	search_string1[0] = search_string2[0] = search_string3[0] = NULLCHAR;
+	search_string1[0] = search_string2[0] = NULLCHAR;
+	search_string3[0] = search_string4[0] = NULLCHAR;
 	sprintf(buf1, "x/%ldi 0x%lx", max_instructions, start);
 
 	if (symbol_exists("__switch_to")) {
@@ -6287,7 +6408,9 @@ search_for_switch_to(ulong start, ulong end)
 	}
 	if (symbol_exists("__switch_to_asm")) {
 		sprintf(search_string3, 
-			"callq  0x%lx", symbol_value("__switch_to_asm")); 
+			"callq  0x%lx", symbol_value("__switch_to_asm"));
+		sprintf(search_string4,
+			"call   0x%lx", symbol_value("__switch_to_asm"));
 	}
 
 	open_tmpfile();
@@ -6306,6 +6429,8 @@ search_for_switch_to(ulong start, ulong end)
 		if (strlen(search_string2) && strstr(buf1, search_string2))
 			found = TRUE;
 		if (strlen(search_string3) && strstr(buf1, search_string3))
+			found = TRUE;
+		if (strlen(search_string4) && strstr(buf1, search_string4))
 			found = TRUE;
 	}
 	close_tmpfile();
@@ -6354,7 +6479,6 @@ x86_64_irq_eframe_link_init(void)
 	char buf[BUFSIZE];
 	char link_register[BUFSIZE];
         char *arglist[MAXARGS];
-	ulong max_instructions;
 
 	if (machdep->machspec->irq_eframe_link == UNINITIALIZED)
 		machdep->machspec->irq_eframe_link = 0;
@@ -6369,12 +6493,10 @@ x86_64_irq_eframe_link_init(void)
 		return;
 	}
 
-	max_instructions = spn->value - sp->value;
-
 	open_tmpfile();
 
-        sprintf(buf, "x/%ldi 0x%lx",
-		max_instructions, sp->value);
+        sprintf(buf, "disassemble 0x%lx, 0x%lx",
+		sp->value, spn->value);
 
         if (!gdb_pass_through(buf, pc->tmpfile, GNU_RETURN_ON_ERROR))
 		return;
@@ -6383,6 +6505,8 @@ x86_64_irq_eframe_link_init(void)
 
 	rewind(pc->tmpfile);
         while (fgets(buf, BUFSIZE, pc->tmpfile)) {
+		if (STRNEQ(buf, "Dump of assembler code"))
+			continue;
 		if (!strstr(buf, sp->name))
 			break;
 		if ((c = parse_line(buf, arglist)) < 4)
@@ -6995,7 +7119,8 @@ x86_64_virt_phys_base(void)
 	ulong phys, linux_banner_phys;
 
 	if (!(sp = symbol_search("linux_banner")) ||
-	    !((sp->type == 'R') || (sp->type == 'r')))
+	    !((sp->type == 'R') || (sp->type == 'r') ||
+	    (sp->type == 'D')))
 		return FALSE;
 
 	linux_banner_phys = sp->value - __START_KERNEL_map;
@@ -7039,7 +7164,8 @@ x86_64_xendump_p2m_create(struct xendump_data *xd)
 	/*
 	 *  Check for pvops Xen kernel before presuming it's HVM.
 	 */
-	if (symbol_exists("pv_init_ops") && symbol_exists("xen_patch") &&
+	if (symbol_exists("pv_init_ops") &&
+	    (symbol_exists("xen_patch") || symbol_exists("paravirt_patch_default")) &&
 	    (xd->xc_core.header.xch_magic == XC_CORE_MAGIC))
 		return x86_64_pvops_xendump_p2m_create(xd);
 
@@ -7970,13 +8096,23 @@ x86_64_init_hyper(int when)
 
 	case POST_GDB:
 		XEN_HYPER_STRUCT_SIZE_INIT(cpuinfo_x86, "cpuinfo_x86");
-		XEN_HYPER_STRUCT_SIZE_INIT(tss_struct, "tss_struct");
-		if (MEMBER_EXISTS("tss_struct", "__blh")) {
-			XEN_HYPER_ASSIGN_OFFSET(tss_struct_rsp0) = MEMBER_OFFSET("tss_struct", "__blh") + sizeof(short unsigned int);
+		if (symbol_exists("per_cpu__tss_page")) {
+			XEN_HYPER_STRUCT_SIZE_INIT(tss, "tss64");
+			XEN_HYPER_ASSIGN_OFFSET(tss_rsp0) =
+							MEMBER_OFFSET("tss64", "rsp0");
+			XEN_HYPER_MEMBER_OFFSET_INIT(tss_ist, "tss64", "ist");
 		} else {
-			XEN_HYPER_ASSIGN_OFFSET(tss_struct_rsp0) = MEMBER_OFFSET("tss_struct", "rsp0");
+			XEN_HYPER_STRUCT_SIZE_INIT(tss, "tss_struct");
+			XEN_HYPER_MEMBER_OFFSET_INIT(tss_ist, "tss_struct", "ist");
+			if (MEMBER_EXISTS("tss_struct", "__blh")) {
+				XEN_HYPER_ASSIGN_OFFSET(tss_rsp0) =
+					MEMBER_OFFSET("tss_struct", "__blh") +
+								sizeof(short unsigned int);
+			} else	{
+				XEN_HYPER_ASSIGN_OFFSET(tss_rsp0) =
+							MEMBER_OFFSET("tss_struct", "rsp0");
+			}
 		}
-		XEN_HYPER_MEMBER_OFFSET_INIT(tss_struct_ist, "tss_struct", "ist");
 		if (symbol_exists("cpu_data")) {
 			xht->cpu_data_address = symbol_value("cpu_data");
 		}
@@ -8109,7 +8245,7 @@ x86_64_do_not_cache_framesize(struct syment *sp, ulong textaddr)
 			return TRUE;
 		}
 
-		if (STREQ(arglist[instr], "callq"))
+		if (STREQ(arglist[instr], "callq") || STREQ(arglist[instr], "call"))
 			break;
 	}
 	close_tmpfile2();
@@ -8805,6 +8941,19 @@ x86_64_get_kvaddr_ranges(struct vaddr_range *vrp)
 	qsort(vrp, cnt, sizeof(struct vaddr_range), compare_kvaddr);
 
 	return cnt;
+}
+
+static int
+x86_64_get_cpu_reg(int cpu, int regno, const char *name,
+                   int size, void *value)
+{
+        if (regno >= LAST_REGNUM)
+                return FALSE;
+
+        if (VMSS_DUMPFILE())
+                return vmware_vmss_get_cpu_reg(cpu, regno, name, size, value);
+
+        return FALSE;
 }
 
 /*

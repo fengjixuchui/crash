@@ -1,8 +1,8 @@
 /*
  * arm64.c - core analysis suite
  *
- * Copyright (C) 2012-2019 David Anderson
- * Copyright (C) 2012-2019 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2012-2020 David Anderson
+ * Copyright (C) 2012-2020 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -20,6 +20,7 @@
 #include "defs.h"
 #include <elf.h>
 #include <endian.h>
+#include <math.h>
 #include <sys/ioctl.h>
 
 #define NOT_IMPLEMENTED(X) error((X), "%s: function not implemented\n", __func__)
@@ -31,7 +32,9 @@ static int arm64_search_for_kimage_voffset(ulong);
 static int verify_kimage_voffset(void);
 static void arm64_calc_kimage_voffset(void);
 static void arm64_calc_phys_offset(void);
+static void arm64_calc_physvirt_offset(void);
 static void arm64_calc_virtual_memory_ranges(void);
+static void arm64_get_section_size_bits(void);
 static int arm64_kdump_phys_base(ulong *);
 static ulong arm64_processor_speed(void);
 static void arm64_init_kernel_pgd(void);
@@ -43,6 +46,7 @@ static int arm64_vtop_3level_4k(ulong, ulong, physaddr_t *, int);
 static int arm64_vtop_4level_4k(ulong, ulong, physaddr_t *, int);
 static ulong arm64_get_task_pgd(ulong);
 static void arm64_irq_stack_init(void);
+static void arm64_overflow_stack_init(void);
 static void arm64_stackframe_init(void);
 static int arm64_eframe_search(struct bt_info *);
 static int arm64_is_kernel_exception_frame(struct bt_info *, ulong);
@@ -61,6 +65,7 @@ static int arm64_get_dumpfile_stackframe(struct bt_info *, struct arm64_stackfra
 static int arm64_in_kdump_text(struct bt_info *, struct arm64_stackframe *);
 static int arm64_in_kdump_text_on_irq_stack(struct bt_info *);
 static int arm64_switch_stack(struct bt_info *, struct arm64_stackframe *, FILE *);
+static int arm64_switch_stack_from_overflow(struct bt_info *, struct arm64_stackframe *, FILE *);
 static int arm64_get_stackframe(struct bt_info *, struct arm64_stackframe *);
 static void arm64_get_stack_frame(struct bt_info *, ulong *, ulong *);
 static void arm64_gen_hidden_frame(struct bt_info *bt, ulong, struct arm64_stackframe *);
@@ -76,14 +81,40 @@ static int arm64_get_smp_cpus(void);
 static void arm64_clear_machdep_cache(void);
 static int arm64_on_process_stack(struct bt_info *, ulong);
 static int arm64_in_alternate_stack(int, ulong);
+static int arm64_in_alternate_stackv(int cpu, ulong stkptr, ulong *stacks, ulong stack_size);
 static int arm64_on_irq_stack(int, ulong);
+static int arm64_on_overflow_stack(int, ulong);
 static void arm64_set_irq_stack(struct bt_info *);
+static void arm64_set_overflow_stack(struct bt_info *);
 static void arm64_set_process_stack(struct bt_info *);
 static int arm64_get_kvaddr_ranges(struct vaddr_range *);
-static int arm64_get_crash_notes(void);
+static void arm64_get_crash_notes(void);
 static void arm64_calc_VA_BITS(void);
 static int arm64_is_uvaddr(ulong, struct task_context *);
+static void arm64_calc_KERNELPACMASK(void);
 
+struct kernel_range {
+	unsigned long modules_vaddr, modules_end;
+	unsigned long vmalloc_start_addr, vmalloc_end;
+	unsigned long vmemmap_vaddr, vmemmap_end;
+};
+static struct kernel_range *arm64_get_va_range(struct machine_specific *ms);
+static void arm64_get_struct_page_size(struct machine_specific *ms);
+
+static void arm64_calc_kernel_start(void)
+{
+	struct machine_specific *ms = machdep->machspec;
+	struct syment *sp;
+
+	if (THIS_KERNEL_VERSION >= LINUX(5,11,0))
+		sp = kernel_symbol_search("_stext");
+	else
+		sp = kernel_symbol_search("_text");
+
+	ms->kimage_text = (sp ? sp->value : 0);
+	sp = kernel_symbol_search("_end");
+	ms->kimage_end = (sp ? sp->value : 0);
+}
 
 /*
  * Do all necessary machine-specific setup here. This is called several times
@@ -178,17 +209,16 @@ arm64_init(int when)
 
 		}
 
+		/*
+		 * This code section will only be executed if the kernel is
+		 * earlier than Linux 4.4 (if there is no vmcoreinfo)
+		 */
 		if (!machdep->pagesize &&
 		    kernel_symbol_exists("swapper_pg_dir") &&
 		    kernel_symbol_exists("idmap_pg_dir")) {
-			if (kernel_symbol_exists("tramp_pg_dir"))
-				value = symbol_value("tramp_pg_dir");
-			else if (kernel_symbol_exists("reserved_ttbr0"))
-				value = symbol_value("reserved_ttbr0");
-			else
-				value = symbol_value("swapper_pg_dir");
+			value = symbol_value("swapper_pg_dir") -
+				symbol_value("idmap_pg_dir");
 
-			value -= symbol_value("idmap_pg_dir");
 			/*
 			 * idmap_pg_dir is 2 pages prior to 4.1,
 			 * and 3 pages thereafter.  Only 4K and 64K 
@@ -212,12 +242,17 @@ arm64_init(int when)
 		machdep->pageoffset = machdep->pagesize - 1;
 		machdep->pagemask = ~((ulonglong)machdep->pageoffset);
 
-		arm64_calc_VA_BITS();
 		ms = machdep->machspec;
+		arm64_get_struct_page_size(ms);
+		arm64_calc_VA_BITS();
+		arm64_calc_KERNELPACMASK();
+
+		/* vabits_actual introduced after mm flip, so it should be flipped layout */
 		if (ms->VA_BITS_ACTUAL) {
-			ms->page_offset = ARM64_PAGE_OFFSET_ACTUAL;
-			machdep->identity_map_base = ARM64_PAGE_OFFSET_ACTUAL;
-			machdep->kvbase = ARM64_PAGE_OFFSET_ACTUAL;
+			ms->page_offset = ARM64_FLIP_PAGE_OFFSET;
+			/* useless on arm64 */
+			machdep->identity_map_base = ARM64_FLIP_PAGE_OFFSET;
+			machdep->kvbase = ARM64_FLIP_PAGE_OFFSET;
 			ms->userspace_top = ARM64_USERSPACE_TOP_ACTUAL;
 		} else {
 			ms->page_offset = ARM64_PAGE_OFFSET;
@@ -227,25 +262,41 @@ arm64_init(int when)
 		}
 		machdep->is_kvaddr = generic_is_kvaddr;
 		machdep->kvtop = arm64_kvtop;
+
+		/* The defaults */
+		ms->vmalloc_end = ARM64_VMALLOC_END;
+		ms->vmemmap_vaddr = ARM64_VMEMMAP_VADDR;
+		ms->vmemmap_end = ARM64_VMEMMAP_END;
+
 		if (machdep->flags & NEW_VMEMMAP) {
 			struct syment *sp;
+			struct kernel_range *r;
 
+			/* It is finally decided in arm64_calc_kernel_start() */
 			sp = kernel_symbol_search("_text");
 			ms->kimage_text = (sp ? sp->value : 0);
 			sp = kernel_symbol_search("_end");
 			ms->kimage_end = (sp ? sp->value : 0);
 
-			if (ms->VA_BITS_ACTUAL) {
+			if (ms->struct_page_size && (r = arm64_get_va_range(ms))) {
+				/* We can get all the MODULES/VMALLOC/VMEMMAP ranges now.*/
+				ms->modules_vaddr	= r->modules_vaddr;
+				ms->modules_end		= r->modules_end - 1;
+				ms->vmalloc_start_addr	= r->vmalloc_start_addr;
+				ms->vmalloc_end		= r->vmalloc_end - 1;
+				ms->vmemmap_vaddr	= r->vmemmap_vaddr;
+				ms->vmemmap_end		= r->vmemmap_end - 1;
+			} else if (ms->VA_BITS_ACTUAL) {
 				ms->modules_vaddr = (st->_stext_vmlinux & TEXT_OFFSET_MASK) - ARM64_MODULES_VSIZE;
 				ms->modules_end = ms->modules_vaddr + ARM64_MODULES_VSIZE -1;
+				ms->vmalloc_start_addr = ms->modules_end + 1;
 			} else {
 				ms->modules_vaddr = ARM64_VA_START;
 				if (kernel_symbol_exists("kasan_init"))
 					ms->modules_vaddr += ARM64_KASAN_SHADOW_SIZE;
 				ms->modules_end = ms->modules_vaddr + ARM64_MODULES_VSIZE -1;
+				ms->vmalloc_start_addr = ms->modules_end + 1;
 			}
-
-			ms->vmalloc_start_addr = ms->modules_end + 1;
 
 			arm64_calc_kimage_voffset();
 		} else {
@@ -253,9 +304,6 @@ arm64_init(int when)
 			ms->modules_end = ARM64_PAGE_OFFSET - 1;
 			ms->vmalloc_start_addr = ARM64_VA_START;
 		}
-		ms->vmalloc_end = ARM64_VMALLOC_END;
-		ms->vmemmap_vaddr = ARM64_VMEMMAP_VADDR;
-		ms->vmemmap_end = ARM64_VMEMMAP_END;
 
 		switch (machdep->pagesize)
 		{
@@ -362,6 +410,7 @@ arm64_init(int when)
 
 		/* use machdep parameters */
 		arm64_calc_phys_offset();
+		arm64_calc_physvirt_offset();
 	
 		if (CRASHDEBUG(1)) {
 			if (machdep->flags & NEW_VMEMMAP)
@@ -369,13 +418,22 @@ arm64_init(int when)
 					machdep->machspec->kimage_voffset);
 			fprintf(fp, "phys_offset: %lx\n", 
 				machdep->machspec->phys_offset);
+			fprintf(fp, "physvirt_offset: %lx\n", machdep->machspec->physvirt_offset);
 		}
 
 		break;
 
 	case POST_GDB:
-		arm64_calc_virtual_memory_ranges();
-		machdep->section_size_bits = _SECTION_SIZE_BITS;
+		/* Rely on kernel version to decide the kernel start address */
+		arm64_calc_kernel_start();
+
+		/*  Can we get the size of struct page before POST_GDB */
+		ms = machdep->machspec;
+		if (!ms->struct_page_size)
+			arm64_calc_virtual_memory_ranges();
+
+		arm64_get_section_size_bits();
+
 		if (!machdep->max_physmem_bits) {
 			if ((string = pc->read_vmcoreinfo("NUMBER(MAX_PHYSMEM_BITS)"))) {
 				machdep->max_physmem_bits = atol(string);
@@ -388,14 +446,12 @@ arm64_init(int when)
 				machdep->max_physmem_bits = _MAX_PHYSMEM_BITS;
 		}
 
-		ms = machdep->machspec;
-
 		if (CRASHDEBUG(1)) {
 			if (ms->VA_BITS_ACTUAL) {
 				fprintf(fp, "CONFIG_ARM64_VA_BITS: %ld\n", ms->CONFIG_ARM64_VA_BITS);
 				fprintf(fp, "      VA_BITS_ACTUAL: %ld\n", ms->VA_BITS_ACTUAL);
 				fprintf(fp, "(calculated) VA_BITS: %ld\n", ms->VA_BITS);
-				fprintf(fp, " PAGE_OFFSET: %lx\n", ARM64_PAGE_OFFSET_ACTUAL);
+				fprintf(fp, " PAGE_OFFSET: %lx\n", ARM64_FLIP_PAGE_OFFSET);
 				fprintf(fp, "    VA_START: %lx\n", ms->VA_START);
 				fprintf(fp, "     modules: %lx - %lx\n", ms->modules_vaddr, ms->modules_end);
 				fprintf(fp, "     vmalloc: %lx - %lx\n", ms->vmalloc_start_addr, ms->vmalloc_end);
@@ -454,30 +510,395 @@ arm64_init(int when)
 			machdep->hz = 100;
 
 		arm64_irq_stack_init();
+		arm64_overflow_stack_init();
 		arm64_stackframe_init();
 		break;
 
-	case POST_VM:
+	case POST_INIT:
 		/*
 		 * crash_notes contains machine specific information about the
 		 * crash. In particular, it contains CPU registers at the time
 		 * of the crash. We need this information to extract correct
 		 * backtraces from the panic task.
 		 */
-		if (!LIVE() && !arm64_get_crash_notes())
-			error(WARNING, 
-			    "cannot retrieve registers for active task%s\n\n",
-				kt->cpus > 1 ? "s" : "");
-
+		if (!LIVE()) 
+			arm64_get_crash_notes();
 		break;
 
 	case LOG_ONLY:
 		machdep->machspec = &arm64_machine_specific;
 		arm64_calc_VA_BITS();
+		arm64_calc_KERNELPACMASK();
 		arm64_calc_phys_offset();
 		machdep->machspec->page_offset = ARM64_PAGE_OFFSET;
+		arm64_calc_physvirt_offset();
 		break;
 	}
+}
+
+struct kernel_va_range_handler {
+	unsigned long kernel_versions_start; /* include */
+	unsigned long kernel_versions_end;   /* exclude */
+	struct kernel_range *(*get_range)(struct machine_specific *);
+};
+
+static struct kernel_range tmp_range;
+#define _PAGE_END(va)		(-(1UL << ((va) - 1)))
+#define SZ_64K                          0x00010000
+#define SZ_2M				0x00200000
+
+/*
+ * Get the max shift of the size of struct page.
+ * Most of the time, it is 64 bytes, but not sure.
+ */
+static int arm64_get_struct_page_max_shift(struct machine_specific *ms)
+{
+	return (int)ceil(log2(ms->struct_page_size));
+}
+
+/* Return TRUE if we succeed, return FALSE on failure. */
+static int arm64_get_vmcoreinfo_ul(unsigned long *vaddr, const char* label)
+{
+	char *string = pc->read_vmcoreinfo(label);
+
+	if (!string)
+		return FALSE;
+
+	*vaddr  = strtoul(string, NULL, 0);
+	free(string);
+	return TRUE;
+}
+
+/*
+ *  The change is caused by the kernel patch since v5.18-rc1:
+ *    "arm64: crash_core: Export MODULES, VMALLOC, and VMEMMAP ranges"
+ */
+static struct kernel_range *arm64_get_range_v5_18(struct machine_specific *ms)
+{
+	struct kernel_range *r = &tmp_range;
+
+	/* Get the MODULES_VADDR ~ MODULES_END */
+	if (!arm64_get_vmcoreinfo_ul(&r->modules_vaddr, "NUMBER(MODULES_VADDR)"))
+		return NULL;
+	if (!arm64_get_vmcoreinfo_ul(&r->modules_end, "NUMBER(MODULES_END)"))
+		return NULL;
+
+	/* Get the VMEMMAP_START ~ VMEMMAP_END */
+	if (!arm64_get_vmcoreinfo_ul(&r->vmemmap_vaddr, "NUMBER(VMEMMAP_START)"))
+		return NULL;
+	if (!arm64_get_vmcoreinfo_ul(&r->vmemmap_end, "NUMBER(VMEMMAP_END)"))
+		return NULL;
+
+	/* Get the VMALLOC_START ~ VMALLOC_END */
+	if (!arm64_get_vmcoreinfo_ul(&r->vmalloc_start_addr, "NUMBER(VMALLOC_START)"))
+		return NULL;
+	if (!arm64_get_vmcoreinfo_ul(&r->vmalloc_end, "NUMBER(VMALLOC_END)"))
+		return NULL;
+
+	return r;
+}
+
+/*
+ *  The change is caused by the kernel patch since v5.17-rc1:
+ *    "b89ddf4cca43 arm64/bpf: Remove 128MB limit for BPF JIT programs"
+ */
+static struct kernel_range *arm64_get_range_v5_17(struct machine_specific *ms)
+{
+	struct kernel_range *r = &tmp_range;
+	unsigned long v = ms->CONFIG_ARM64_VA_BITS;
+	unsigned long vmem_shift, vmemmap_size;
+
+	/* Not initialized yet */
+	if (v == 0)
+		return NULL;
+
+	if (v > 48)
+		v = 48;
+
+	/* Get the MODULES_VADDR ~ MODULES_END */
+	r->modules_vaddr = _PAGE_END(v);
+	r->modules_end = r->modules_vaddr + MEGABYTES(128);
+
+	/* Get the VMEMMAP_START ~ VMEMMAP_END */
+	vmem_shift = machdep->pageshift - arm64_get_struct_page_max_shift(ms);
+	vmemmap_size = (_PAGE_END(v) - PAGE_OFFSET) >> vmem_shift;
+
+	r->vmemmap_vaddr = (-(1UL << (ms->CONFIG_ARM64_VA_BITS - vmem_shift)));
+	r->vmemmap_end = r->vmemmap_vaddr + vmemmap_size;
+
+	/* Get the VMALLOC_START ~ VMALLOC_END */
+	r->vmalloc_start_addr = r->modules_end;
+	r->vmalloc_end = r->vmemmap_vaddr - MEGABYTES(256);
+	return r;
+}
+
+/*
+ *  The change is caused by the kernel patch since v5.11:
+ *    "9ad7c6d5e75b arm64: mm: tidy up top of kernel VA space"
+ */
+static struct kernel_range *arm64_get_range_v5_11(struct machine_specific *ms)
+{
+	struct kernel_range *r = &tmp_range;
+	unsigned long v = ms->CONFIG_ARM64_VA_BITS;
+	unsigned long vmem_shift, vmemmap_size, bpf_jit_size = MEGABYTES(128);
+
+	/* Not initialized yet */
+	if (v == 0)
+		return NULL;
+
+	if (v > 48)
+		v = 48;
+
+	/* Get the MODULES_VADDR ~ MODULES_END */
+	r->modules_vaddr = _PAGE_END(v) + bpf_jit_size;
+	r->modules_end = r->modules_vaddr + MEGABYTES(128);
+
+	/* Get the VMEMMAP_START ~ VMEMMAP_END */
+	vmem_shift = machdep->pageshift - arm64_get_struct_page_max_shift(ms);
+	vmemmap_size = (_PAGE_END(v) - PAGE_OFFSET) >> vmem_shift;
+
+	r->vmemmap_vaddr = (-(1UL << (ms->CONFIG_ARM64_VA_BITS - vmem_shift)));
+	r->vmemmap_end = r->vmemmap_vaddr + vmemmap_size;
+
+	/* Get the VMALLOC_START ~ VMALLOC_END */
+	r->vmalloc_start_addr = r->modules_end;
+	r->vmalloc_end = r->vmemmap_vaddr - MEGABYTES(256);
+	return r;
+}
+
+static unsigned long arm64_get_pud_size(void)
+{
+	unsigned long PUD_SIZE = 0;
+
+	switch (machdep->pagesize) {
+	case 4096:
+		if (machdep->machspec->VA_BITS > PGDIR_SHIFT_L4_4K) {
+			PUD_SIZE = PUD_SIZE_L4_4K;
+		} else {
+			PUD_SIZE = PGDIR_SIZE_L3_4K;
+		}
+		break;
+
+	case 65536:
+		PUD_SIZE = PGDIR_SIZE_L2_64K;
+	default:
+		break;
+	}
+	return PUD_SIZE;
+}
+
+/*
+ *  The change is caused by the kernel patches since v5.4, such as:
+ *     "ce3aaed87344 arm64: mm: Modify calculation of VMEMMAP_SIZE"
+ *     "14c127c957c1 arm64: mm: Flip kernel VA space"
+ */
+static struct kernel_range *arm64_get_range_v5_4(struct machine_specific *ms)
+{
+	struct kernel_range *r = &tmp_range;
+	unsigned long v = ms->CONFIG_ARM64_VA_BITS;
+	unsigned long kasan_shadow_shift, kasan_shadow_offset, PUD_SIZE;
+	unsigned long vmem_shift, vmemmap_size, bpf_jit_size = MEGABYTES(128);
+	char *string;
+	int ret;
+
+	/* Not initialized yet */
+	if (v == 0)
+		return NULL;
+
+	if (v > 48)
+		v = 48;
+
+	/* Get the MODULES_VADDR ~ MODULES_END */
+	if (kernel_symbol_exists("kasan_init")) {
+		/* See the arch/arm64/Makefile */
+		ret = get_kernel_config("CONFIG_KASAN_SW_TAGS", NULL);
+		if (ret == IKCONFIG_N)
+			return NULL;
+		kasan_shadow_shift = (ret == IKCONFIG_Y) ? 4: 3;
+
+		/* See the arch/arm64/Kconfig*/
+		ret = get_kernel_config("CONFIG_KASAN_SHADOW_OFFSET", &string);
+		if (ret != IKCONFIG_STR)
+			return NULL;
+		kasan_shadow_offset = atol(string);
+
+		r->modules_vaddr = (1UL << (64 - kasan_shadow_shift)) + kasan_shadow_offset
+				+ bpf_jit_size;
+	} else {
+		r->modules_vaddr = _PAGE_END(v) + bpf_jit_size;
+	}
+
+	r->modules_end = r->modules_vaddr + MEGABYTES(128);
+
+	/* Get the VMEMMAP_START ~ VMEMMAP_END */
+	vmem_shift = machdep->pageshift - arm64_get_struct_page_max_shift(ms);
+	vmemmap_size = (_PAGE_END(v) - PAGE_OFFSET) >> vmem_shift;
+
+	r->vmemmap_vaddr = (-vmemmap_size - SZ_2M);
+	/*
+	 *  In the v5.7, the patch: "bbd6ec605c arm64/mm: Enable memory hot remove"
+	 *      adds the VMEMMAP_END.
+	 *
+	 *  But before the VMEMMAP_END was added to kernel, we can also see
+	 *  the following in arch/arm64/mm/dump.c:
+	 *   { VMEMMAP_START + VMEMMAP_SIZE,	"vmemmap end" },
+	 */
+	r->vmemmap_end = r->vmemmap_vaddr + vmemmap_size;
+
+	/* Get the VMALLOC_START ~ VMALLOC_END */
+	PUD_SIZE = arm64_get_pud_size();
+	r->vmalloc_start_addr = r->modules_end;
+	r->vmalloc_end = (-PUD_SIZE - vmemmap_size - SZ_64K);
+	return r;
+}
+
+/*
+ *  The change is caused by the kernel patches since v5.0, such as:
+ *    "91fc957c9b1d arm64/bpf: don't allocate BPF JIT programs in module memory"
+ */
+static struct kernel_range *arm64_get_range_v5_0(struct machine_specific *ms)
+{
+	struct kernel_range *r = &tmp_range;
+	unsigned long v = ms->CONFIG_ARM64_VA_BITS;
+	unsigned long kasan_shadow_shift, PUD_SIZE;
+	unsigned long vmemmap_size, bpf_jit_size = MEGABYTES(128);
+	unsigned long va_start, page_offset;
+	int ret;
+
+	/* Not initialized yet */
+	if (v == 0)
+		return NULL;
+
+	va_start = (0xffffffffffffffffUL - (1UL << v) + 1);
+	page_offset = (0xffffffffffffffffUL - (1UL << (v - 1)) + 1);
+
+	/* Get the MODULES_VADDR ~ MODULES_END */
+	if (kernel_symbol_exists("kasan_init")) {
+		/* See the arch/arm64/Makefile */
+		ret = get_kernel_config("CONFIG_KASAN_SW_TAGS", NULL);
+		if (ret == IKCONFIG_N)
+			return NULL;
+		kasan_shadow_shift = (ret == IKCONFIG_Y) ? 4: 3;
+
+		r->modules_vaddr = va_start + (1UL << (v - kasan_shadow_shift)) + bpf_jit_size;
+	} else {
+		r->modules_vaddr = va_start  + bpf_jit_size;
+	}
+
+	r->modules_end = r->modules_vaddr + MEGABYTES(128);
+
+	/* Get the VMEMMAP_START ~ VMEMMAP_END */
+	vmemmap_size = (1UL << (v - machdep->pageshift - 1 + arm64_get_struct_page_max_shift(ms)));
+
+	r->vmemmap_vaddr = page_offset - vmemmap_size;
+	r->vmemmap_end = r->vmemmap_vaddr + vmemmap_size; /* See the arch/arm64/mm/dump.c */
+
+	/* Get the VMALLOC_START ~ VMALLOC_END */
+	PUD_SIZE = arm64_get_pud_size();
+
+	r->vmalloc_start_addr = r->modules_end;
+	r->vmalloc_end = page_offset - PUD_SIZE - vmemmap_size - SZ_64K;
+	return r;
+}
+
+static struct kernel_va_range_handler kernel_va_range_handlers[] = {
+	{
+		LINUX(5,18,0),
+		LINUX(999,0,0), /* Just a boundary */
+		get_range: arm64_get_range_v5_18,
+	}, {
+		LINUX(5,17,0), LINUX(5,18,0),
+		get_range: arm64_get_range_v5_17,
+	}, {
+		LINUX(5,11,0), LINUX(5,17,0),
+		get_range: arm64_get_range_v5_11,
+	}, {
+		LINUX(5,4,0), LINUX(5,11,0),
+		get_range: arm64_get_range_v5_4,
+	}, {
+		LINUX(5,0,0), LINUX(5,4,0),
+		get_range: arm64_get_range_v5_0,
+	},
+};
+
+#define ARRAY_SIZE(a) (sizeof (a) / sizeof ((a)[0]))
+
+static unsigned long arm64_get_kernel_version(void)
+{
+	char *string;
+	char buf[BUFSIZE];
+	char *p1, *p2;
+
+	if (THIS_KERNEL_VERSION)
+		return THIS_KERNEL_VERSION;
+
+	string = pc->read_vmcoreinfo("OSRELEASE");
+	if (string) {
+		strcpy(buf, string);
+
+		p1 = p2 = buf;
+		while (*p2 != '.')
+			p2++;
+		*p2 = NULLCHAR;
+		kt->kernel_version[0] = atoi(p1);
+
+		p1 = ++p2;
+		while (*p2 != '.')
+			p2++;
+		*p2 = NULLCHAR;
+		kt->kernel_version[1] = atoi(p1);
+
+		p1 = ++p2;
+		while ((*p2 >= '0') && (*p2 <= '9'))
+			p2++;
+		*p2 = NULLCHAR;
+		kt->kernel_version[2] = atoi(p1);
+	}
+	free(string);
+	return THIS_KERNEL_VERSION;
+}
+
+/* Return NULL if we fail. */
+static struct kernel_range *arm64_get_va_range(struct machine_specific *ms)
+{
+	struct kernel_va_range_handler *h;
+	unsigned long kernel_version = arm64_get_kernel_version();
+	struct kernel_range *r = NULL;
+	int i;
+
+	if (!kernel_version)
+		goto range_failed;
+
+	for (i = 0; i < ARRAY_SIZE(kernel_va_range_handlers); i++) {
+		h = kernel_va_range_handlers + i;
+
+		/* Get the right hook for this kernel version */
+		if (h->kernel_versions_start <= kernel_version &&
+			kernel_version < h->kernel_versions_end) {
+
+			/* Get the correct virtual address ranges */
+			r = h->get_range(ms);
+			if (!r)
+				goto range_failed;
+			return r;
+		}
+	}
+
+range_failed:
+	/* Reset ms->struct_page_size to 0 for arm64_calc_virtual_memory_ranges() */
+	ms->struct_page_size = 0;
+	return NULL;
+}
+
+/* Get the size of struct page {} */
+static void arm64_get_struct_page_size(struct machine_specific *ms)
+{
+	char *string;
+
+	string = pc->read_vmcoreinfo("SIZE(page)");
+	if (string)
+		ms->struct_page_size = atol(string);
+	free(string);
 }
 
 /*
@@ -505,9 +926,11 @@ arm64_verify_symbol(const char *name, ulong value, char type)
 	    ((type == 'a') || (type == 'n') || (type == 'N') || (type == 'U')))
 		return FALSE;
 
-	if (STREQ(name, "$d") || STREQ(name, "$x"))
+	if (STREQ(name, "$d") || STRNEQ(name, "$d.") ||
+	    STREQ(name, "$x") || STRNEQ(name, "$x.") ||
+	    STREQ(name, "$c") || STRNEQ(name, "$c."))
 		return FALSE;
-	
+
 	if ((type == 'A') && STRNEQ(name, "__crc_"))
 		return FALSE;
 
@@ -524,7 +947,7 @@ arm64_verify_symbol(const char *name, ulong value, char type)
 void
 arm64_dump_machdep_table(ulong arg)
 {
-	const struct machine_specific *ms;
+	const struct machine_specific *ms = machdep->machspec;
 	int others, i;
 
 	others = 0;
@@ -553,6 +976,10 @@ arm64_dump_machdep_table(ulong arg)
 		fprintf(fp, "%sMACHDEP_BT_TEXT", others++ ? "|" : "");
 	if (machdep->flags & NEW_VMEMMAP)
 		fprintf(fp, "%sNEW_VMEMMAP", others++ ? "|" : "");
+	if (machdep->flags & FLIPPED_VM)
+		fprintf(fp, "%sFLIPPED_VM", others++ ? "|" : "");
+	if (machdep->flags & HAS_PHYSVIRT_OFFSET)
+		fprintf(fp, "%sHAS_PHYSVIRT_OFFSET", others++ ? "|" : "");
 	fprintf(fp, ")\n");
 
 	fprintf(fp, "              kvbase: %lx\n", machdep->kvbase);
@@ -646,9 +1073,8 @@ arm64_dump_machdep_table(ulong arg)
 			machdep->cmdline_args[i] : "(unused)");
 	}
 
-	ms = machdep->machspec;
-
 	fprintf(fp, "            machspec: %lx\n", (ulong)ms);
+	fprintf(fp, "      struct_page_size: %ld\n", ms->struct_page_size);
 	fprintf(fp, "               VA_BITS: %ld\n", ms->VA_BITS);
 	fprintf(fp, "  CONFIG_ARM64_VA_BITS: %ld\n", ms->CONFIG_ARM64_VA_BITS);
 	fprintf(fp, "              VA_START: ");
@@ -659,6 +1085,11 @@ arm64_dump_machdep_table(ulong arg)
 	fprintf(fp, "        VA_BITS_ACTUAL: ");
 	if (ms->VA_BITS_ACTUAL)
 		fprintf(fp, "%ld\n", ms->VA_BITS_ACTUAL);
+	else
+		fprintf(fp, "(unused)\n");
+	fprintf(fp, "CONFIG_ARM64_KERNELPACMASK: ");
+	if (ms->CONFIG_ARM64_KERNELPACMASK)
+		fprintf(fp, "%lx\n", ms->CONFIG_ARM64_KERNELPACMASK);
 	else
 		fprintf(fp, "(unused)\n");
 	fprintf(fp, "         userspace_top: %016lx\n", ms->userspace_top);
@@ -675,6 +1106,7 @@ arm64_dump_machdep_table(ulong arg)
 		fprintf(fp, "        kimage_voffset: %016lx\n", ms->kimage_voffset);
 	}
 	fprintf(fp, "           phys_offset: %lx\n", ms->phys_offset);
+	fprintf(fp, "       physvirt_offset: %lx\n", ms->physvirt_offset);
 	fprintf(fp, "__exception_text_start: %lx\n", ms->__exception_text_start);
 	fprintf(fp, "  __exception_text_end: %lx\n", ms->__exception_text_end);
 	fprintf(fp, " __irqentry_text_start: %lx\n", ms->__irqentry_text_start);
@@ -749,6 +1181,8 @@ arm64_parse_machdep_arg_l(char *argstring, char *param, ulong *value)
 
 		if (STRNEQ(argstring, "max_physmem_bits")) {
 			*value = dtol(p, flags, &err);
+		} else if (STRNEQ(argstring, "vabits_actual")) {
+			*value = dtol(p, flags, &err);
 		} else if (megabytes) {
 			*value = dtol(p, flags, &err);
 			if (!err)
@@ -817,6 +1251,12 @@ arm64_parse_cmdline_args(void)
 				error(NOTE,
 					"setting max_physmem_bits to: %ld\n\n",
 					machdep->max_physmem_bits);
+				continue;
+			} else if (arm64_parse_machdep_arg_l(arglist[i], "vabits_actual",
+			        &machdep->machspec->VA_BITS_ACTUAL)) {
+				error(NOTE,
+					"setting vabits_actual to: %ld\n\n",
+					machdep->machspec->VA_BITS_ACTUAL);
 				continue;
 			}
 
@@ -960,6 +1400,57 @@ arm64_calc_kimage_voffset(void)
 		ms->kimage_voffset += (kt->relocate * -1);
 }
 
+/*
+ * The physvirt_offset only exits in kernel [5.4, 5.10)
+ *
+ *   1) In kernel v5.4, the patch:
+ *        "5383cc6efed137 arm64: mm: Introduce vabits_actual"
+ *
+ *      introduced the physvirt_offset.
+ *
+ *   2) In kernel v5.10, the patch:
+ *          "7bc1a0f9e17658 arm64: mm: use single quantity
+ *                           to represent the PA to VA translation"
+ *      removed the physvirt_offset.
+ */
+static void
+arm64_calc_physvirt_offset(void)
+{
+	struct machine_specific *ms = machdep->machspec;
+	ulong physvirt_offset;
+	struct syment *sp;
+	ulong value;
+
+	if ((sp = kernel_symbol_search("physvirt_offset")) &&
+			machdep->machspec->kimage_voffset) {
+		if (pc->flags & PROC_KCORE) {
+			value = symbol_value_from_proc_kallsyms("physvirt_offset");
+			if ((value != BADVAL) &&
+				(READMEM(pc->mfd, &physvirt_offset, sizeof(ulong),
+					   value, KCORE_USE_VADDR) > 0)) {
+				machdep->flags |= HAS_PHYSVIRT_OFFSET;
+				ms->physvirt_offset = physvirt_offset;
+
+				/* Update the ms->phys_offset which is wrong */
+				ms->phys_offset = ms->physvirt_offset + ms->page_offset;
+				return;
+			}
+		}
+
+		if (READMEM(pc->mfd, &physvirt_offset, sizeof(physvirt_offset),
+			sp->value, sp->value -
+			machdep->machspec->kimage_voffset) > 0) {
+				machdep->flags |= HAS_PHYSVIRT_OFFSET;
+				ms->physvirt_offset = physvirt_offset;
+				return;
+		}
+	}
+
+	/* Useless if no symbol 'physvirt_offset', just keep semantics */
+	ms->physvirt_offset = ms->phys_offset - ms->page_offset;
+
+}
+
 static void
 arm64_calc_phys_offset(void)
 {
@@ -1004,6 +1495,7 @@ arm64_calc_phys_offset(void)
 			if (READMEM(pc->mfd, &phys_offset, sizeof(phys_offset),
 			    vaddr, paddr) > 0) {
 				ms->phys_offset = phys_offset;
+
 				return;
 			}
 		}
@@ -1055,6 +1547,37 @@ arm64_calc_phys_offset(void)
 		fprintf(fp, "using %lx as phys_offset\n", ms->phys_offset);
 }
 
+/*
+ *  Determine SECTION_SIZE_BITS either by reading VMCOREINFO or the kernel
+ *  config, otherwise use the 64-bit ARM default definiton.
+ */
+static void
+arm64_get_section_size_bits(void)
+{
+	int ret;
+	char *string;
+
+	if (THIS_KERNEL_VERSION >= LINUX(5,12,0)) {
+		if (machdep->pagesize == 65536)
+			machdep->section_size_bits = _SECTION_SIZE_BITS_5_12_64K;
+		else
+			machdep->section_size_bits = _SECTION_SIZE_BITS_5_12;
+	} else
+		machdep->section_size_bits = _SECTION_SIZE_BITS;
+
+	if ((string = pc->read_vmcoreinfo("NUMBER(SECTION_SIZE_BITS)"))) {
+		machdep->section_size_bits = atol(string);
+		free(string);
+	} else if (kt->ikconfig_flags & IKCONFIG_AVAIL) {
+		if ((ret = get_kernel_config("CONFIG_MEMORY_HOTPLUG", NULL)) == IKCONFIG_Y) {
+			if ((ret = get_kernel_config("CONFIG_HOTPLUG_SIZE_BITS", &string)) == IKCONFIG_STR)
+				machdep->section_size_bits = atol(string);
+		} 
+	}
+
+	if (CRASHDEBUG(1))
+		fprintf(fp, "SECTION_SIZE_BITS: %ld\n", machdep->section_size_bits);
+}
 
 /*
  *  Determine PHYS_OFFSET either by reading VMCOREINFO or the kernel
@@ -1106,6 +1629,21 @@ arm64_init_kernel_pgd(void)
                 vt->kernel_pgd[i] = value;
 }
 
+ulong arm64_PTOV(ulong paddr)
+{
+	struct machine_specific *ms = machdep->machspec;
+
+	/*
+	 * Either older kernel before kernel has 'physvirt_offset' or newer
+	 * kernel which removes 'physvirt_offset' has the same formula:
+	 * #define __phys_to_virt(x)   ((unsigned long)((x) - PHYS_OFFSET) | PAGE_OFFSET)
+	 */
+	if (!(machdep->flags & HAS_PHYSVIRT_OFFSET))
+		return (paddr - ms->phys_offset) | PAGE_OFFSET;
+	else
+		return paddr - ms->physvirt_offset;
+}
+
 ulong
 arm64_VTOP(ulong addr)
 {
@@ -1116,9 +1654,18 @@ arm64_VTOP(ulong addr)
 			return addr - machdep->machspec->kimage_voffset;
 		}
 
-		if (addr >= machdep->machspec->page_offset)
-			return machdep->machspec->phys_offset
-				+ (addr - machdep->machspec->page_offset);
+		if (addr >= machdep->machspec->page_offset) {
+			if (machdep->flags & HAS_PHYSVIRT_OFFSET) {
+				return addr + machdep->machspec->physvirt_offset;
+			} else {
+				/*
+				 * Either older kernel before kernel has 'physvirt_offset' or newer
+				 * kernel which removes 'physvirt_offset' has the same formula:
+				 * #define __lm_to_phys(addr)	(((addr) & ~PAGE_OFFSET) + PHYS_OFFSET)
+				 */
+				return (addr & ~PAGE_OFFSET) + machdep->machspec->phys_offset;
+			}
+		}
 		else if (machdep->machspec->kimage_voffset)
 			return addr - machdep->machspec->kimage_voffset;
 		else /* no randomness */
@@ -1197,11 +1744,14 @@ arm64_uvtop(struct task_context *tc, ulong uvaddr, physaddr_t *paddr, int verbos
 #define PTE_TO_PHYS(pteval)  (machdep->max_physmem_bits == 52 ? \
 	(((pteval & PTE_ADDR_LOW) | ((pteval & PTE_ADDR_HIGH) << 36))) : (pteval & PTE_ADDR_LOW))
 
+#define PUD_TYPE_MASK   3
+#define PUD_TYPE_SECT   1
 #define PMD_TYPE_MASK   3
 #define PMD_TYPE_SECT   1
 #define PMD_TYPE_TABLE  2
 #define SECTION_PAGE_MASK_2MB    ((long)(~((MEGABYTES(2))-1)))
 #define SECTION_PAGE_MASK_512MB  ((long)(~((MEGABYTES(512))-1)))
+#define SECTION_PAGE_MASK_1GB    ((long)(~((GIGABYTES(1))-1)))
 
 static int 
 arm64_vtop_2level_64k(ulong pgd, ulong vaddr, physaddr_t *paddr, int verbose)
@@ -1357,6 +1907,15 @@ arm64_vtop_3level_4k(ulong pgd, ulong vaddr, physaddr_t *paddr, int verbose)
 	if (!pgd_val)
 		goto no_page;
 
+	if ((pgd_val & PUD_TYPE_MASK) == PUD_TYPE_SECT) {
+		ulong sectionbase = (pgd_val & SECTION_PAGE_MASK_1GB) & PHYS_MASK;
+		if (verbose) {
+			fprintf(fp, "  PAGE: %lx  (1GB)\n\n", sectionbase);
+			arm64_translate_pte(pgd_val, 0, 0);
+		}
+		*paddr = sectionbase + (vaddr & ~SECTION_PAGE_MASK_1GB);
+		return TRUE;
+	}
 	/* 
 	 * #define __PAGETABLE_PUD_FOLDED 
 	 */
@@ -1439,6 +1998,16 @@ arm64_vtop_4level_4k(ulong pgd, ulong vaddr, physaddr_t *paddr, int verbose)
                 fprintf(fp, "   PUD: %lx => %lx\n", (ulong)pud_ptr, pud_val);
 	if (!pud_val)
 		goto no_page;
+
+	if ((pud_val & PUD_TYPE_MASK) == PUD_TYPE_SECT) {
+		ulong sectionbase = (pud_val & SECTION_PAGE_MASK_1GB) & PHYS_MASK;
+		if (verbose) {
+			fprintf(fp, "  PAGE: %lx  (1GB)\n\n", sectionbase);
+			arm64_translate_pte(pud_val, 0, 0);
+		}
+		*paddr = sectionbase + (vaddr & ~SECTION_PAGE_MASK_1GB);
+		return TRUE;
+	}
 
 	pmd_base = (ulong *)PTOV(pud_val & PHYS_MASK & (s32)machdep->pagemask);
 	FILL_PMD(pmd_base, KVADDR, PTRS_PER_PMD_L4_4K * sizeof(ulong));
@@ -1598,6 +2167,49 @@ arm64_irq_stack_init(void)
 }
 
 /*
+ *  Gather Overflow stack values.
+ *
+ *  Overflow stack supported since 4.14, in commit 872d8327c
+ */
+static void
+arm64_overflow_stack_init(void)
+{
+	int i;
+	struct syment *sp;
+	struct gnu_request request, *req;
+	struct machine_specific *ms = machdep->machspec;
+	req = &request;
+
+	if (symbol_exists("overflow_stack") &&
+	    (sp = per_cpu_symbol_search("overflow_stack")) &&
+	    get_symbol_type("overflow_stack", NULL, req)) {
+		if (CRASHDEBUG(1)) {
+			fprintf(fp, "overflow_stack: \n");
+			fprintf(fp, "  type: %x, %s\n",
+				(int)req->typecode,
+				(req->typecode == TYPE_CODE_ARRAY) ?
+						"TYPE_CODE_ARRAY" : "other");
+			fprintf(fp, "  target_typecode: %x, %s\n",
+				(int)req->target_typecode,
+				req->target_typecode == TYPE_CODE_INT ?
+						"TYPE_CODE_INT" : "other");
+			fprintf(fp, "  target_length: %ld\n",
+						req->target_length);
+			fprintf(fp, "  length: %ld\n", req->length);
+		}
+
+		if (!(ms->overflow_stacks = (ulong *)malloc((size_t)(kt->cpus * sizeof(ulong)))))
+			error(FATAL, "cannot malloc overflow_stack addresses\n");
+
+		ms->overflow_stack_size = ARM64_OVERFLOW_STACK_SIZE;
+		machdep->flags |= OVERFLOW_STACKS;
+
+		for (i = 0; i < kt->cpus; i++)
+			ms->overflow_stacks[i] = kt->__per_cpu_offset[i] + sp->value;
+	}
+}
+
+/*
  *  Gather and verify all of the backtrace requirements.
  */
 static void
@@ -1621,10 +2233,11 @@ arm64_stackframe_init(void)
 		machdep->machspec->kern_eframe_offset = SIZE(pt_regs);
 	}
 
-	machdep->machspec->__exception_text_start = 
-		symbol_value("__exception_text_start");
-	machdep->machspec->__exception_text_end = 
-		symbol_value("__exception_text_end");
+	if ((sp1 = kernel_symbol_search("__exception_text_start")) &&
+	    (sp2 = kernel_symbol_search("__exception_text_end"))) {
+		machdep->machspec->__exception_text_start = sp1->value;
+		machdep->machspec->__exception_text_end = sp2->value;
+	}
 	if ((sp1 = kernel_symbol_search("__irqentry_text_start")) &&
 	    (sp2 = kernel_symbol_search("__irqentry_text_end"))) {
 		machdep->machspec->__irqentry_text_start = sp1->value; 
@@ -1750,13 +2363,14 @@ static int
 arm64_is_kernel_exception_frame(struct bt_info *bt, ulong stkptr)
 {
         struct arm64_pt_regs *regs;
+	struct machine_specific *ms = machdep->machspec;
 
         regs = (struct arm64_pt_regs *)&bt->stackbuf[(ulong)(STACK_OFFSET_TYPE(stkptr))];
 
 	if (INSTACK(regs->sp, bt) && INSTACK(regs->regs[29], bt) && 
 	    !(regs->pstate & (0xffffffff00000000ULL | PSR_MODE32_BIT)) &&
 	    is_kernel_text(regs->pc) &&
-	    is_kernel_text(regs->regs[30])) {
+	    is_kernel_text(regs->regs[30] | ms->CONFIG_ARM64_KERNELPACMASK)) {
 		switch (regs->pstate & PSR_MODE_MASK)
 		{
 		case PSR_MODE_EL1t:
@@ -1833,19 +2447,41 @@ arm64_eframe_search(struct bt_info *bt)
 	return count;
 }
 
+static char *arm64_exception_functions[] = {
+        "do_undefinstr",
+        "do_sysinstr",
+        "do_debug_exception",
+        "do_mem_abort",
+        "do_el0_irq_bp_hardening",
+        "do_sp_pc_abort",
+        "handle_bad_stack",
+        NULL
+};
+
 static int
 arm64_in_exception_text(ulong ptr)
 {
 	struct machine_specific *ms = machdep->machspec;
-
-	if ((ptr >= ms->__exception_text_start) &&
-	    (ptr < ms->__exception_text_end))
-		return TRUE;
+	char *name, **func;
 
 	if (ms->__irqentry_text_start && ms->__irqentry_text_end &&
 	    ((ptr >= ms->__irqentry_text_start) && 
 	    (ptr < ms->__irqentry_text_end)))
 		return TRUE;
+
+	if (ms->__exception_text_start && ms->__exception_text_end) {
+		if ((ptr >= ms->__exception_text_start) &&
+		    (ptr < ms->__exception_text_end))
+			return TRUE;
+	}
+
+	name = closest_symbol(ptr);
+	if (name != NULL) { /* Linux 5.5 and later */
+		for (func = &arm64_exception_functions[0]; *func; func++) {
+			if (STREQ(name, *func))
+				return TRUE;
+		}
+	}
 
 	return FALSE;
 }
@@ -1882,6 +2518,7 @@ arm64_print_stackframe_entry(struct bt_info *bt, int level, struct arm64_stackfr
          * See, for example, "bl schedule" before ret_to_user().
          */
 	branch_pc = frame->pc - 4;
+
         name = closest_symbol(branch_pc);
         name_plus_offset = NULL;
 
@@ -2093,7 +2730,7 @@ arm64_unwind_frame(struct bt_info *bt, struct arm64_stackframe *frame)
 	unsigned long stack_mask;
 	unsigned long irq_stack_ptr, orig_sp;
 	struct arm64_pt_regs *ptregs;
-	struct machine_specific *ms;
+	struct machine_specific *ms = machdep->machspec;
 
 	stack_mask = (unsigned long)(ARM64_STACK_SIZE) - 1;
 	fp = frame->fp;
@@ -2107,19 +2744,20 @@ arm64_unwind_frame(struct bt_info *bt, struct arm64_stackframe *frame)
 	frame->sp = fp + 0x10;
 	frame->fp = GET_STACK_ULONG(fp);
 	frame->pc = GET_STACK_ULONG(fp + 8);
+	if (is_kernel_text(frame->pc | ms->CONFIG_ARM64_KERNELPACMASK))
+		frame->pc |= ms->CONFIG_ARM64_KERNELPACMASK;
 
 	if ((frame->fp == 0) && (frame->pc == 0))
 		return FALSE;
 
-	if (!(machdep->flags & IRQ_STACKS))
-		return TRUE;
-
-	if (!(machdep->flags & IRQ_STACKS))
+	if (!(machdep->flags & (IRQ_STACKS | OVERFLOW_STACKS)))
 		return TRUE;
 
 	if (machdep->flags & UNW_4_14) {
-		if ((bt->flags & BT_IRQSTACK) &&
-		    !arm64_on_irq_stack(bt->tc->processor, frame->fp)) {
+		if (((bt->flags & BT_IRQSTACK) &&
+		     !arm64_on_irq_stack(bt->tc->processor, frame->fp)) ||
+		    ((bt->flags & BT_OVERFLOW_STACK) &&
+		     !arm64_on_overflow_stack(bt->tc->processor, frame->fp))) {
 			if (arm64_on_process_stack(bt, frame->fp)) {
 				arm64_set_process_stack(bt);
 
@@ -2158,7 +2796,6 @@ arm64_unwind_frame(struct bt_info *bt, struct arm64_stackframe *frame)
 	 *  irq_stack_ptr = IRQ_STACK_PTR(raw_smp_processor_id());
 	 *  orig_sp = IRQ_STACK_TO_TASK_STACK(irq_stack_ptr);   (pt_regs pointer on process stack)
 	 */
-	ms = machdep->machspec;
 	irq_stack_ptr = ms->irq_stacks[bt->tc->processor] + ms->irq_stack_size - 16;
 
 	if (frame->sp == irq_stack_ptr) {
@@ -2537,6 +3174,9 @@ arm64_back_trace_cmd(struct bt_info *bt)
 		if (arm64_on_irq_stack(bt->tc->processor, bt->frameptr)) {
 			arm64_set_irq_stack(bt);
 			bt->flags |= BT_IRQSTACK;
+		} else if (arm64_on_overflow_stack(bt->tc->processor, bt->frameptr)) {
+			arm64_set_overflow_stack(bt);
+			bt->flags |= BT_OVERFLOW_STACK;
 		}
 		stackframe.sp = bt->stkptr;
 		stackframe.pc = bt->instptr;
@@ -2591,7 +3231,9 @@ arm64_back_trace_cmd(struct bt_info *bt)
 			break;
 
 		if (arm64_in_exception_text(bt->instptr) && INSTACK(stackframe.fp, bt)) {
-			if (!(bt->flags & BT_IRQSTACK) ||
+			if (bt->flags & BT_OVERFLOW_STACK) {
+				exception_frame = stackframe.fp - KERN_EFRAME_OFFSET;
+			} else if (!(bt->flags & BT_IRQSTACK) ||
 			    ((stackframe.sp + SIZE(pt_regs)) < bt->stacktop)) {
 				if (arm64_is_kernel_exception_frame(bt, stackframe.fp - KERN_EFRAME_OFFSET))
 					exception_frame = stackframe.fp - KERN_EFRAME_OFFSET;
@@ -2605,6 +3247,12 @@ arm64_back_trace_cmd(struct bt_info *bt)
 				break;
 		}
 
+		if ((bt->flags & BT_OVERFLOW_STACK) &&
+		    !arm64_on_overflow_stack(bt->tc->processor, stackframe.fp)) {
+			bt->flags &= ~BT_OVERFLOW_STACK;
+			if (arm64_switch_stack_from_overflow(bt, &stackframe, ofp) == USER_MODE)
+				break;
+		}
 
 		level++;
 	}
@@ -2760,6 +3408,8 @@ arm64_print_text_symbols(struct bt_info *bt, struct arm64_stackframe *frame, FIL
 	char buf2[BUFSIZE];
 	char *name;
 	ulong start;
+	ulong val;
+	struct machine_specific *ms = machdep->machspec;
 
 	if (bt->flags & BT_TEXT_SYMBOLS_ALL)
 		start = bt->stackbase;
@@ -2774,8 +3424,10 @@ arm64_print_text_symbols(struct bt_info *bt, struct arm64_stackframe *frame, FIL
 
 	for (i = (start - bt->stackbase)/sizeof(ulong); i < LONGS_PER_STACK; i++) {
 		up = (ulong *)(&bt->stackbuf[i*sizeof(ulong)]);
-		if (is_kernel_text(*up)) {
-			name = closest_symbol(*up);
+		val = *up;
+		if (is_kernel_text(val | ms->CONFIG_ARM64_KERNELPACMASK)) {
+			val |= ms->CONFIG_ARM64_KERNELPACMASK;
+			name = closest_symbol(val);
 			fprintf(ofp, "  %s[%s] %s at %lx",
 				bt->flags & BT_ERROR_MASK ?
 				"  " : "",
@@ -2784,13 +3436,13 @@ arm64_print_text_symbols(struct bt_info *bt, struct arm64_stackframe *frame, FIL
 				MKSTR(bt->stackbase + 
 				(i * sizeof(long)))),
 				bt->flags & BT_SYMBOL_OFFSET ?
-				value_to_symstr(*up, buf2, bt->radix) :
-				name, *up);
-			if (module_symbol(*up, NULL, &lm, NULL, 0))
+				value_to_symstr(val, buf2, bt->radix) :
+				name, val);
+			if (module_symbol(val, NULL, &lm, NULL, 0))
 				fprintf(ofp, " [%s]", lm->mod_name);
 			fprintf(ofp, "\n");
 			if (BT_REFERENCE_CHECK(bt))
-				arm64_do_bt_reference_check(bt, *up, name);
+				arm64_do_bt_reference_check(bt, val, name);
 		}
 	}
 }
@@ -2988,10 +3640,53 @@ arm64_switch_stack(struct bt_info *bt, struct arm64_stackframe *frame, FILE *ofp
 }
 
 static int
+arm64_switch_stack_from_overflow(struct bt_info *bt, struct arm64_stackframe *frame, FILE *ofp)
+{
+	int i;
+	ulong stacktop, words, addr;
+	ulong *stackbuf;
+	char buf[BUFSIZE];
+	struct machine_specific *ms = machdep->machspec;
+
+	if (bt->flags & BT_FULL) {
+		stacktop = ms->overflow_stacks[bt->tc->processor] + ms->overflow_stack_size;
+		words = (stacktop - bt->bptr) / sizeof(ulong);
+		stackbuf = (ulong *)GETBUF(words * sizeof(ulong));
+		readmem(bt->bptr, KVADDR, stackbuf, words * sizeof(long),
+			"top of overflow stack", FAULT_ON_ERROR);
+
+		addr = bt->bptr;
+		for (i = 0; i < words; i++) {
+			if (!(i & 1))
+				fprintf(ofp, "%s    %lx: ", i ? "\n" : "", addr);
+			fprintf(ofp, "%s ", format_stack_entry(bt, buf, stackbuf[i], 0));
+			addr += sizeof(ulong);
+		}
+		fprintf(ofp, "\n");
+		FREEBUF(stackbuf);
+	}
+	fprintf(ofp, "--- <Overflow stack> ---\n");
+
+	if (frame->fp == 0)
+		return USER_MODE;
+
+	if (!(machdep->flags & UNW_4_14))
+		arm64_print_exception_frame(bt, frame->sp, KERNEL_MODE, ofp);
+
+	return KERNEL_MODE;
+}
+
+static int
 arm64_get_dumpfile_stackframe(struct bt_info *bt, struct arm64_stackframe *frame)
 {
 	struct machine_specific *ms = machdep->machspec;
 	struct arm64_pt_regs *ptregs;
+	bool skip = false;
+
+	if (bt->flags & BT_SKIP_IDLE) {
+		skip = true;
+		bt->flags &= ~BT_SKIP_IDLE;
+	}
 
 	if (!ms->panic_task_regs ||
 	    (!ms->panic_task_regs[bt->tc->processor].sp && 
@@ -3024,8 +3719,11 @@ try_kernel:
 	}
 
 	if (arm64_in_kdump_text(bt, frame) || 
-	    arm64_in_kdump_text_on_irq_stack(bt))
+	    arm64_in_kdump_text_on_irq_stack(bt)) {
 		bt->flags |= BT_KDUMP_ADJUST;
+		if (skip && is_idle_thread(bt->task))
+			bt->flags |= BT_SKIP_IDLE;
+	}
 
 	return TRUE;
 }
@@ -3049,10 +3747,14 @@ arm64_get_stack_frame(struct bt_info *bt, ulong *pcp, ulong *spp)
 	int ret;
 	struct arm64_stackframe stackframe = { 0 };
 
-	if (DUMPFILE() && is_task_active(bt->task))
+	if (DUMPFILE() && is_task_active(bt->task)) {
 		ret = arm64_get_dumpfile_stackframe(bt, &stackframe);
-	else
+	} else {
+		if (bt->flags & BT_SKIP_IDLE)
+			bt->flags &= ~BT_SKIP_IDLE;
+
 		ret = arm64_get_stackframe(bt, &stackframe);
+	}
 
 	if (!ret)
 		error(WARNING, 
@@ -3093,6 +3795,7 @@ arm64_print_exception_frame(struct bt_info *bt, ulong pt_regs, int mode, FILE *o
 	struct syment *sp;
 	ulong LR, SP, offset;
 	char buf[BUFSIZE];
+	struct machine_specific *ms = machdep->machspec;
 
 	if (CRASHDEBUG(1)) 
 		fprintf(ofp, "pt_regs: %lx\n", pt_regs);
@@ -3108,6 +3811,8 @@ arm64_print_exception_frame(struct bt_info *bt, ulong pt_regs, int mode, FILE *o
 		rows = 4;
 	} else {
 		LR = regs->regs[30];
+		if (is_kernel_text (LR | ms->CONFIG_ARM64_KERNELPACMASK))
+			LR |= ms->CONFIG_ARM64_KERNELPACMASK;
 		SP = regs->sp;
 		top_reg = 29;
 		is_64_bit = TRUE;
@@ -3535,6 +4240,16 @@ arm64_display_machine_stats(void)
 				machdep->machspec->irq_stacks[i]);
 		}
 	}
+	if (machdep->machspec->overflow_stack_size) {
+		fprintf(fp, "OVERFLOW STACK SIZE: %ld\n",
+			machdep->machspec->overflow_stack_size);
+		fprintf(fp, "    OVERFLOW STACKS:\n");
+		for (i = 0; i < kt->cpus; i++) {
+			pad = (i < 10) ? 3 : (i < 100) ? 2 : (i < 1000) ? 1 : 0;
+			fprintf(fp, "%s           CPU %d: %lx\n", space(pad), i,
+				machdep->machspec->overflow_stacks[i]);
+		}
+	}
 }
 
 static int
@@ -3552,19 +4267,53 @@ arm64_get_smp_cpus(void)
 /*
  * Retrieve task registers for the time of the crash.
  */
-static int
+static void
 arm64_get_crash_notes(void)
 {
 	struct machine_specific *ms = machdep->machspec;
 	ulong crash_notes;
-	Elf64_Nhdr *note;
+	Elf64_Nhdr *note = NULL;
 	ulong offset;
 	char *buf, *p;
 	ulong *notes_ptrs;
-	ulong i;
+	ulong i, found;
 
-	if (!symbol_exists("crash_notes"))
-		return FALSE;
+	if (!symbol_exists("crash_notes")) {
+		if (DISKDUMP_DUMPFILE() || KDUMP_DUMPFILE()) {
+			if (!(ms->panic_task_regs = calloc((size_t)kt->cpus, sizeof(struct arm64_pt_regs))))
+				error(FATAL, "cannot calloc panic_task_regs space\n");
+
+			for  (i = found = 0; i < kt->cpus; i++) {
+				if (DISKDUMP_DUMPFILE())
+					note = diskdump_get_prstatus_percpu(i);
+				else if (KDUMP_DUMPFILE())
+					note = netdump_get_prstatus_percpu(i);
+
+				if (!note) {
+					error(WARNING, "cpu %d: cannot find NT_PRSTATUS note\n", i);
+					continue;
+				}
+
+				/*
+				 * Find correct location of note data. This contains elf_prstatus
+				 * structure which has registers etc. for the crashed task.
+				 */
+				offset = sizeof(Elf64_Nhdr);
+				offset = roundup(offset + note->n_namesz, 4);
+				p = (char *)note + offset; /* start of elf_prstatus */
+
+				BCOPY(p + OFFSET(elf_prstatus_pr_reg), &ms->panic_task_regs[i],
+				      sizeof(struct arm64_pt_regs));
+
+				found++;
+			}
+			if (!found) {
+				free(ms->panic_task_regs);
+				ms->panic_task_regs = NULL;
+			}
+		}
+		return;
+	}
 
 	crash_notes = symbol_value("crash_notes");
 
@@ -3576,9 +4325,9 @@ arm64_get_crash_notes(void)
 	 */
 	if (!readmem(crash_notes, KVADDR, &notes_ptrs[kt->cpus-1], 
 	    sizeof(notes_ptrs[kt->cpus-1]), "crash_notes", RETURN_ON_ERROR)) {
-		error(WARNING, "cannot read crash_notes\n");
+		error(WARNING, "cannot read \"crash_notes\"\n");
 		FREEBUF(notes_ptrs);
-		return FALSE;
+		return;
 	}
 
 	if (symbol_exists("__per_cpu_offset")) {
@@ -3594,12 +4343,11 @@ arm64_get_crash_notes(void)
 	if (!(ms->panic_task_regs = calloc((size_t)kt->cpus, sizeof(struct arm64_pt_regs))))
 		error(FATAL, "cannot calloc panic_task_regs space\n");
 	
-	for  (i = 0; i < kt->cpus; i++) {
-
+	for  (i = found = 0; i < kt->cpus; i++) {
 		if (!readmem(notes_ptrs[i], KVADDR, buf, SIZE(note_buf), 
 		    "note_buf_t", RETURN_ON_ERROR)) {
-			error(WARNING, "failed to read note_buf_t\n");
-			goto fail;
+			error(WARNING, "cpu %d: cannot read NT_PRSTATUS note\n", i);
+			continue;
 		}
 
 		/*
@@ -3629,19 +4377,24 @@ arm64_get_crash_notes(void)
 				    note->n_descsz == notesz)
 					BCOPY((char *)note, buf, notesz);
 			} else {
-				error(WARNING,
-					"cannot find NT_PRSTATUS note for cpu: %d\n", i);
+				error(WARNING, "cpu %d: cannot find NT_PRSTATUS note\n", i);
 				continue;
 			}
 		}
 
+		/*
+		 * Check the sanity of NT_PRSTATUS note only for each online cpu.
+		 * If this cpu has invalid note, continue to find the crash notes
+		 * for other online cpus.
+		 */
 		if (note->n_type != NT_PRSTATUS) {
-			error(WARNING, "invalid note (n_type != NT_PRSTATUS)\n");
-			goto fail;
+			error(WARNING, "cpu %d: invalid NT_PRSTATUS note (n_type != NT_PRSTATUS)\n", i);
+			continue;
 		}
-		if (p[0] != 'C' || p[1] != 'O' || p[2] != 'R' || p[3] != 'E') {
-			error(WARNING, "invalid note (name != \"CORE\"\n");
-			goto fail;
+
+		if (!STRNEQ(p, "CORE")) {
+			error(WARNING, "cpu %d: invalid NT_PRSTATUS note (name != \"CORE\")\n", i);
+			continue;
 		}
 
 		/*
@@ -3654,18 +4407,17 @@ arm64_get_crash_notes(void)
 
 		BCOPY(p + OFFSET(elf_prstatus_pr_reg), &ms->panic_task_regs[i],
 		      sizeof(struct arm64_pt_regs));
+
+		found++;
 	}
 
 	FREEBUF(buf);
 	FREEBUF(notes_ptrs);
-	return TRUE;
 
-fail:
-	FREEBUF(buf);
-	FREEBUF(notes_ptrs);
-	free(ms->panic_task_regs);
-	ms->panic_task_regs = NULL;
-	return FALSE;
+	if (!found) {
+		free(ms->panic_task_regs);
+		ms->panic_task_regs = NULL;
+	}
 }
 
 static void
@@ -3691,24 +4443,41 @@ arm64_on_process_stack(struct bt_info *bt, ulong stkptr)
 }
 
 static int
-arm64_on_irq_stack(int cpu, ulong stkptr)
+arm64_in_alternate_stackv(int cpu, ulong stkptr, ulong *stacks, ulong stack_size)
 {
-	return arm64_in_alternate_stack(cpu, stkptr);
+	if ((cpu >= kt->cpus) || (stacks == NULL) || !stack_size)
+		return FALSE;
+
+	if ((stkptr >= stacks[cpu]) &&
+	    (stkptr < (stacks[cpu] + stack_size)))
+		return TRUE;
+
+	return FALSE;
 }
 
 static int
 arm64_in_alternate_stack(int cpu, ulong stkptr)
 {
+	return (arm64_on_irq_stack(cpu, stkptr) ||
+		arm64_on_overflow_stack(cpu, stkptr));
+}
+
+static int
+arm64_on_irq_stack(int cpu, ulong stkptr)
+{
 	struct machine_specific *ms = machdep->machspec;
 
-	if (!ms->irq_stack_size || (cpu >= kt->cpus))
-		return FALSE;
+	return arm64_in_alternate_stackv(cpu, stkptr,
+			ms->irq_stacks, ms->irq_stack_size);
+}
 
-	if ((stkptr >= ms->irq_stacks[cpu]) &&
-	    (stkptr < (ms->irq_stacks[cpu] + ms->irq_stack_size)))
-		return TRUE;
+static int
+arm64_on_overflow_stack(int cpu, ulong stkptr)
+{
+	struct machine_specific *ms = machdep->machspec;
 
-	return FALSE;
+	return arm64_in_alternate_stackv(cpu, stkptr,
+			ms->overflow_stacks, ms->overflow_stack_size);
 }
 
 static void
@@ -3718,6 +4487,16 @@ arm64_set_irq_stack(struct bt_info *bt)
 
 	bt->stackbase = ms->irq_stacks[bt->tc->processor];
 	bt->stacktop = bt->stackbase + ms->irq_stack_size;
+	alter_stackbuf(bt);
+}
+
+static void
+arm64_set_overflow_stack(struct bt_info *bt)
+{
+	struct machine_specific *ms = machdep->machspec;
+
+	bt->stackbase = ms->overflow_stacks[bt->tc->processor];
+	bt->stacktop = bt->stackbase + ms->overflow_stack_size;
 	alter_stackbuf(bt);
 }
 
@@ -3794,7 +4573,8 @@ arm64_IS_VMALLOC_ADDR(ulong vaddr)
 
         return ((vaddr >= ms->vmalloc_start_addr && vaddr <= ms->vmalloc_end) ||
                 ((machdep->flags & VMEMMAP) &&
-                 (vaddr >= ms->vmemmap_vaddr && vaddr <= ms->vmemmap_end)) ||
+                ((vaddr >= ms->vmemmap_vaddr && vaddr <= ms->vmemmap_end) ||
+                (vaddr >= ms->vmalloc_end && vaddr <= ms->vmemmap_vaddr))) ||
                 (vaddr >= ms->modules_vaddr && vaddr <= ms->modules_end));
 }
 
@@ -3828,16 +4608,43 @@ arm64_calc_VA_BITS(void)
 		} else if (ACTIVE())
 			error(FATAL, "cannot determine VA_BITS_ACTUAL: please use /proc/kcore\n");
 		else {
-			if ((string = pc->read_vmcoreinfo("NUMBER(VA_BITS_ACTUAL)"))) {
-				value = atol(string);
+			if ((string = pc->read_vmcoreinfo("NUMBER(TCR_EL1_T1SZ)")) ||
+			    (string = pc->read_vmcoreinfo("NUMBER(tcr_el1_t1sz)"))) {
+				/* See ARMv8 ARM for the description of
+				 * TCR_EL1.T1SZ and how it can be used
+				 * to calculate the vabits_actual
+				 * supported by underlying kernel.
+				 *
+				 * Basically:
+				 * vabits_actual = 64 - T1SZ;
+				 */
+				value = 64 - strtoll(string, NULL, 0);
+				if (CRASHDEBUG(1))
+					fprintf(fp,  "vmcoreinfo : vabits_actual: %ld\n", value);
 				free(string);
 				machdep->machspec->VA_BITS_ACTUAL = value;
 				machdep->machspec->VA_BITS = value;
+				machdep->machspec->VA_START = _VA_START(machdep->machspec->VA_BITS_ACTUAL);
+			} else if (machdep->machspec->VA_BITS_ACTUAL) {
+				machdep->machspec->VA_BITS = machdep->machspec->VA_BITS_ACTUAL;
+				machdep->machspec->VA_START = _VA_START(machdep->machspec->VA_BITS_ACTUAL);
+			} else if (machdep->machspec->CONFIG_ARM64_VA_BITS) {
+				/* guess */
+				machdep->machspec->VA_BITS_ACTUAL = machdep->machspec->CONFIG_ARM64_VA_BITS;
+				machdep->machspec->VA_BITS = machdep->machspec->CONFIG_ARM64_VA_BITS;
 				machdep->machspec->VA_START = _VA_START(machdep->machspec->VA_BITS_ACTUAL);
 			} else
 				error(FATAL, "cannot determine VA_BITS_ACTUAL\n");
 		}
 
+		if (machdep->machspec->CONFIG_ARM64_VA_BITS)
+			machdep->machspec->VA_BITS = machdep->machspec->CONFIG_ARM64_VA_BITS;
+
+		/*
+		 * The mm flip commit is introduced before 52-bits VA, which is before the
+		 * commit to export NUMBER(TCR_EL1_T1SZ)
+		 */
+		machdep->flags |= FLIPPED_VM;
 		return;
 	}
 
@@ -3906,7 +4713,6 @@ arm64_calc_VA_BITS(void)
 #define ALIGN(x, a) __ALIGN_KERNEL((x), (a))
 #define __ALIGN_KERNEL(x, a)            __ALIGN_KERNEL_MASK(x, (typeof(x))(a) - 1)
 #define __ALIGN_KERNEL_MASK(x, mask)    (((x) + (mask)) & ~(mask))
-#define SZ_64K                          0x00010000
 
 static void
 arm64_calc_virtual_memory_ranges(void)
@@ -3914,6 +4720,7 @@ arm64_calc_virtual_memory_ranges(void)
 	struct machine_specific *ms = machdep->machspec;
 	ulong value, vmemmap_start, vmemmap_end, vmemmap_size, vmalloc_end;
 	char *string;
+	int ret;
 	ulong PUD_SIZE = UNINITIALIZED;
 
 	if (!machdep->machspec->CONFIG_ARM64_VA_BITS) {
@@ -3921,6 +4728,10 @@ arm64_calc_virtual_memory_ranges(void)
 			value = atol(string);
 			free(string);
 			machdep->machspec->CONFIG_ARM64_VA_BITS = value;
+		} else if (kt->ikconfig_flags & IKCONFIG_AVAIL) {
+			if ((ret = get_kernel_config("CONFIG_ARM64_VA_BITS",
+					&string)) == IKCONFIG_STR)
+				machdep->machspec->CONFIG_ARM64_VA_BITS = atol(string);
 		}
 	}
 
@@ -3945,9 +4756,14 @@ arm64_calc_virtual_memory_ranges(void)
 #define STRUCT_PAGE_MAX_SHIFT   6
 
 	if (ms->VA_BITS_ACTUAL) {
-		vmemmap_size = (1UL) << (ms->CONFIG_ARM64_VA_BITS - machdep->pageshift - 1 + STRUCT_PAGE_MAX_SHIFT);
+		ulong va_bits_min = 48;
+
+		if (machdep->machspec->CONFIG_ARM64_VA_BITS < 48)
+			va_bits_min = ms->CONFIG_ARM64_VA_BITS;
+
+		vmemmap_size = (1UL) << (va_bits_min - machdep->pageshift - 1 + STRUCT_PAGE_MAX_SHIFT);
 		vmalloc_end = (- PUD_SIZE - vmemmap_size - KILOBYTES(64));
-		vmemmap_start = (-vmemmap_size);
+		vmemmap_start = (-vmemmap_size - MEGABYTES(2));
 		ms->vmalloc_end = vmalloc_end - 1;
 		ms->vmemmap_vaddr = vmemmap_start;
 		ms->vmemmap_end = -1;
@@ -4001,6 +4817,20 @@ arm64_swp_offset(ulong pte)
 	if (ms->__SWP_OFFSET_MASK)
 		pte &= ms->__SWP_OFFSET_MASK;
 	return pte;
+}
+
+static void arm64_calc_KERNELPACMASK(void)
+{
+	ulong value;
+	char *string;
+
+	if ((string = pc->read_vmcoreinfo("NUMBER(KERNELPACMASK)"))) {
+		value = htol(string, QUIET, NULL);
+		free(string);
+		machdep->machspec->CONFIG_ARM64_KERNELPACMASK = value;
+		if (CRASHDEBUG(1))
+			fprintf(fp, "CONFIG_ARM64_KERNELPACMASK: %lx\n", value);
+	}
 }
 
 #endif  /* ARM64 */

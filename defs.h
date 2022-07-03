@@ -1,8 +1,8 @@
 /* defs.h - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002-2019 David Anderson
- * Copyright (C) 2002-2019 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2020 David Anderson
+ * Copyright (C) 2002-2020 Red Hat, Inc. All rights reserved.
  * Copyright (C) 2002 Silicon Graphics, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -18,6 +18,7 @@
 
 #ifndef GDB_COMMON
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -54,6 +55,9 @@
 #ifdef SNAPPY
 #include <snappy-c.h>
 #endif
+#ifdef ZSTD
+#include <zstd.h>
+#endif
 
 #ifndef ATTRIBUTE_UNUSED
 #define ATTRIBUTE_UNUSED __attribute__ ((__unused__))
@@ -71,7 +75,8 @@
 
 #if !defined(X86) && !defined(X86_64) && !defined(ALPHA) && !defined(PPC) && \
     !defined(IA64) && !defined(PPC64) && !defined(S390) && !defined(S390X) && \
-    !defined(ARM) && !defined(ARM64) && !defined(MIPS) && !defined(SPARC64)
+    !defined(ARM) && !defined(ARM64) && !defined(MIPS) && !defined(MIPS64) && \
+    !defined(SPARC64)
 #ifdef __alpha__
 #define ALPHA
 #endif
@@ -104,7 +109,11 @@
 #define ARM64
 #endif
 #ifdef __mipsel__
+#ifndef __mips64
 #define MIPS
+#else
+#define MIPS64
+#endif
 #endif
 #ifdef __sparc_v9__
 #define SPARC64
@@ -127,7 +136,7 @@
 #define NR_CPUS  (4096)
 #endif
 #ifdef PPC64
-#define NR_CPUS  (2048)
+#define NR_CPUS  (8192)
 #endif
 #ifdef S390
 #define NR_CPUS  (512)
@@ -143,6 +152,9 @@
 #endif
 #ifdef MIPS
 #define NR_CPUS  (32)
+#endif
+#ifdef MIPS64
+#define NR_CPUS  (256)
 #endif
 #ifdef SPARC64
 #define NR_CPUS  (4096)
@@ -319,6 +331,7 @@ struct number_option {
 #define NO_ELF_NOTES        (0x20)
 #define LZO_SUPPORTED       (0x40)
 #define SNAPPY_SUPPORTED    (0x80)
+#define ZSTD_SUPPORTED      (0x100)
 #define DISKDUMP_VALID()    (dd->flags & DISKDUMP_LOCAL)
 #define KDUMP_CMPRS_VALID() (dd->flags & KDUMP_CMPRS_LOCAL)
 #define KDUMP_SPLIT()       (dd->flags & DUMPFILE_SPLIT)
@@ -353,6 +366,7 @@ struct number_option {
 #define READ_ERROR       (-2)
 #define WRITE_ERROR      (-3)
 #define PAGE_EXCLUDED    (-4)
+#define PAGE_INCOMPLETE  (-5)
 
 #define RESTART()         (longjmp(pc->main_loop_env, 1))
 #define RESUME_FOREACH()  (longjmp(pc->foreach_loop_env, 1))
@@ -502,7 +516,6 @@ struct program_context {
 	struct sigaction gdb_sigaction; /* gdb's SIGINT sigaction. */
 	jmp_buf main_loop_env;          /* longjmp target default */
 	jmp_buf foreach_loop_env;       /* longjmp target within foreach */
-        jmp_buf gdb_interface_env;      /* longjmp target for gdb error catch */
 	struct termios termios_orig;    /* non-raw settings */
 	struct termios termios_raw;     /* while gathering command input */
 	int ncmds;                      /* number of commands in menu */
@@ -544,6 +557,7 @@ struct program_context {
 #define is_excluded_vmemmap() (pc->flags2 & EXCLUDED_VMEMMAP)
 #define MEMSRC_LOCAL         (0x80000ULL)
 #define REDZONE             (0x100000ULL)
+#define VMWARE_VMSS_GUESTDUMP (0x200000ULL)
 	char *cleanup;
 	char *namelist_orig;
 	char *namelist_debug_orig;
@@ -654,11 +668,14 @@ struct new_utsname {
 #define TIMER_BASES                (0x20ULL)
 #define IRQ_DESC_TREE_RADIX        (0x40ULL)
 #define IRQ_DESC_TREE_XARRAY       (0x80ULL)
+#define KMOD_PAX                  (0x100ULL)
 
 #define XEN()       (kt->flags & ARCH_XEN)
 #define OPENVZ()    (kt->flags & ARCH_OPENVZ)
 #define PVOPS()     (kt->flags & ARCH_PVOPS)
 #define PVOPS_XEN() (kt->flags & ARCH_PVOPS_XEN)
+
+#define PAX_MODULE_SPLIT() (kt->flags2 & KMOD_PAX)
 
 #define XEN_MACHINE_TO_MFN(m)    ((ulonglong)(m) >> PAGESHIFT())
 #define XEN_PFN_TO_PSEUDO(p)     ((ulonglong)(p) << PAGESHIFT())
@@ -763,6 +780,7 @@ struct kernel_table {                   /* kernel data */
 	} vmcoreinfo;
 	ulonglong flags2;
 	char *source_tree;
+	struct timespec boot_date;
 };
 
 /*
@@ -812,6 +830,7 @@ struct task_context {                     /* context stored for each task */
 struct tgid_context {               /* tgid and task stored for each task */
 	ulong tgid;
 	ulong task;
+	long rss_cache;
 };
 
 struct task_table {                      /* kernel/local task table data */
@@ -1045,6 +1064,7 @@ struct machdep_table {
         void (*get_irq_affinity)(int);
         void (*show_interrupts)(int, ulong *);
 	int (*is_page_ptr)(ulong, physaddr_t *);
+	int (*get_cpu_reg)(int, int, const char *, int, void *);
 };
 
 /*
@@ -2073,6 +2093,94 @@ struct offset_table {                    /* stash of commonly-used offsets */
 	long cpu_context_save_r7;
 	long dentry_d_sb;
 	long device_private_knode_class;
+	long timerqueue_head_rb_root;
+	long rb_root_cached_rb_leftmost;
+	long bpf_map_memory;
+	long bpf_map_memory_pages;
+	long bpf_map_memory_user;
+	long bpf_prog_aux_name;
+	long page_private;
+	long swap_info_struct_bdev;
+	long zram_mempoll;
+	long zram_compressor;
+	long zram_table_flag;
+	long zspoll_size_class;
+	long size_class_size;
+	long gendisk_private_data;
+	long zram_table_entry;
+	long module_core_size_rw;
+	long module_core_size_rx;
+	long module_init_size_rw;
+	long module_init_size_rx;
+	long module_module_core_rw;
+	long module_module_core_rx;
+	long module_module_init_rw;
+	long module_module_init_rx;
+	long super_block_s_inodes;
+	long inode_i_sb_list;
+	long irq_common_data_affinity;
+	long irq_desc_irq_common_data;
+	long uts_namespace_name;
+	long printk_info_seq;
+	long printk_info_ts_nsec;
+	long printk_info_text_len;
+	long printk_info_level;
+	long printk_info_caller_id;
+	long printk_info_dev_info;
+	long dev_printk_info_subsystem;
+	long dev_printk_info_device;
+	long prb_desc_ring;
+	long prb_text_data_ring;
+	long prb_desc_ring_count_bits;
+	long prb_desc_ring_descs;
+	long prb_desc_ring_infos;
+	long prb_desc_ring_head_id;
+	long prb_desc_ring_tail_id;
+	long prb_desc_state_var;
+	long prb_desc_text_blk_lpos;
+	long prb_data_blk_lpos_begin;
+	long prb_data_blk_lpos_next;
+	long prb_data_ring_size_bits;
+	long prb_data_ring_data;
+	long atomic_long_t_counter;
+	long block_device_bd_device;
+	long block_device_bd_stats;
+	long wait_queue_entry_private;
+	long wait_queue_head_head;
+	long wait_queue_entry_entry;
+	long printk_safe_seq_buf_len;
+	long printk_safe_seq_buf_message_lost;
+	long printk_safe_seq_buf_buffer;
+	long sbitmap_word_depth;
+	long sbitmap_word_word;
+	long sbitmap_word_cleared;
+	long sbitmap_depth;
+	long sbitmap_shift;
+	long sbitmap_map_nr;
+	long sbitmap_map;
+	long sbitmap_queue_sb;
+	long sbitmap_queue_alloc_hint;
+	long sbitmap_queue_wake_batch;
+	long sbitmap_queue_wake_index;
+	long sbitmap_queue_ws;
+	long sbitmap_queue_ws_active;
+	long sbitmap_queue_round_robin;
+	long sbitmap_queue_min_shallow_depth;
+	long sbq_wait_state_wait_cnt;
+	long sbq_wait_state_wait;
+	long sbitmap_alloc_hint;
+	long sbitmap_round_robin;
+	long request_cmd_flags;
+	long request_q;
+	long request_state;
+	long request_queue_queue_hw_ctx;
+	long request_queue_nr_hw_queues;
+	long blk_mq_hw_ctx_tags;
+	long blk_mq_tags_bitmap_tags;
+	long blk_mq_tags_breserved_tags;
+	long blk_mq_tags_nr_reserved_tags;
+	long blk_mq_tags_rqs;
+	long request_queue_hctx_table;
 };
 
 struct size_table {         /* stash of commonly-used sizes */
@@ -2230,6 +2338,19 @@ struct size_table {         /* stash of commonly-used sizes */
 	long bpf_insn;
 	long xarray;
 	long xa_node;
+	long zram_table_entry;
+	long irq_common_data;
+	long printk_info;
+	long printk_ringbuffer;
+	long prb_desc;
+	long wait_queue_entry;
+	long task_struct_state;
+	long printk_safe_seq_buf_buffer;
+	long sbitmap_word;
+	long sbitmap;
+	long sbitmap_queue;
+	long sbq_wait_state;
+	long blk_mq_tags;
 };
 
 struct array_table {
@@ -2277,6 +2398,7 @@ struct array_table {
 #define MEMBER_TYPE_REQUEST ((struct datatype_member *)(-3))
 #define STRUCT_SIZE_REQUEST ((struct datatype_member *)(-4))
 #define MEMBER_TYPE_NAME_REQUEST ((struct datatype_member *)(-5))
+#define ANON_MEMBER_SIZE_REQUEST ((struct datatype_member *)(-6))
 
 #define STRUCT_SIZE(X)      datatype_info((X), NULL, STRUCT_SIZE_REQUEST)
 #define UNION_SIZE(X)       datatype_info((X), NULL, STRUCT_SIZE_REQUEST)
@@ -2288,12 +2410,15 @@ struct array_table {
 #define MEMBER_TYPE(X,Y)    datatype_info((X), (Y), MEMBER_TYPE_REQUEST)
 #define MEMBER_TYPE_NAME(X,Y)    ((char *)datatype_info((X), (Y), MEMBER_TYPE_NAME_REQUEST))
 #define ANON_MEMBER_OFFSET(X,Y)    datatype_info((X), (Y), ANON_MEMBER_OFFSET_REQUEST)
+#define ANON_MEMBER_SIZE(X,Y)    datatype_info((X), (Y), ANON_MEMBER_SIZE_REQUEST)
 
 /*
  *  The following set of macros can only be used with pre-intialized fields
  *  in the offset table, size table or array_table.
  */
 #define OFFSET(X)	   (OFFSET_verify(offset_table.X, (char *)__FUNCTION__, __FILE__, __LINE__, #X))
+#define MODULE_OFFSET(X,Y) (PAX_MODULE_SPLIT() ? OFFSET(Y) : OFFSET(X))
+#define MODULE_OFFSET2(X,T) MODULE_OFFSET(X, X##_##T)
 #define SIZE(X)            (SIZE_verify(size_table.X, (char *)__FUNCTION__, __FILE__, __LINE__, #X))
 #define INVALID_OFFSET     (-1)
 #define INVALID_MEMBER(X)  (offset_table.X == INVALID_OFFSET)
@@ -2352,6 +2477,7 @@ DEF_LOADER(ushort);
 DEF_LOADER(short);
 typedef void *pointer_t;
 DEF_LOADER(pointer_t);
+DEF_LOADER(bool);
 
 #define LOADER(TYPE) load_##TYPE
 
@@ -2365,6 +2491,7 @@ DEF_LOADER(pointer_t);
 #define SHORT(ADDR)     LOADER(short) ((char *)(ADDR))
 #define UCHAR(ADDR)     *((unsigned char *)((char *)(ADDR)))
 #define VOID_PTR(ADDR)  ((void *) (LOADER(pointer_t) ((char *)(ADDR))))
+#define BOOL(ADDR)      LOADER(bool) ((char *)(ADDR)))
 
 #else
 
@@ -2378,6 +2505,7 @@ DEF_LOADER(pointer_t);
 #define SHORT(ADDR)     *((short *)((char *)(ADDR)))
 #define UCHAR(ADDR)     *((unsigned char *)((char *)(ADDR)))
 #define VOID_PTR(ADDR)  *((void **)((char *)(ADDR)))
+#define BOOL(ADDR)      *((bool *)((char *)(ADDR)))
 
 #endif /* NEED_ALIGNED_MEM_ACCESS */
 
@@ -2502,7 +2630,7 @@ struct datatype_member {        /* minimal definition of a structure/union */
 	long member_size;
 	int member_typecode;
 	ulong flags;
-	char *tagname;         /* tagname and value for enums */
+	const char *tagname;         /* tagname and value for enums */
 	long value;
 	ulong vaddr;
 };
@@ -2539,6 +2667,7 @@ struct list_data {             /* generic structure used by do_list() to walk */
 #define LIST_PARSE_MEMBER   (VERBOSE << 13)
 #define LIST_READ_MEMBER    (VERBOSE << 14)
 #define LIST_BRENT_ALGO     (VERBOSE << 15)
+#define LIST_HEAD_OFFSET_ENTERED  (VERBOSE << 16)
 
 struct tree_data {
 	ulong flags;
@@ -2643,8 +2772,6 @@ struct downsized {
         (((vaddr) >> machdep->pageshift) % SYMVAL_HASH)
 
 #define SYMNAME_HASH (512)
-#define SYMNAME_HASH_INDEX(name) \
- ((name[0] ^ (name[strlen(name)-1] * name[strlen(name)/2])) % SYMNAME_HASH)
 
 #define PATCH_KERNEL_SYMBOLS_START  ((char *)(1))
 #define PATCH_KERNEL_SYMBOLS_STOP   ((char *)(2))
@@ -2694,6 +2821,9 @@ struct symbol_table_data {
 	ulong saved_command_line_vmlinux;
 	ulong pti_init_vmlinux;
 	ulong kaiser_init_vmlinux;
+	int kernel_symbol_type;
+	ulong linux_banner_vmlinux;
+	struct syment *mod_symname_hash[SYMNAME_HASH];
 };
 
 /* flags for st */
@@ -2921,7 +3051,7 @@ typedef struct QEMUCPUState QEMUCPUState;
 #define __swp_type(entry)	SWP_TYPE(entry)
 #define __swp_offset(entry)	SWP_OFFSET(entry)
 
-#define TIF_SIGPENDING		(2)
+#define TIF_SIGPENDING		(THIS_KERNEL_VERSION >= LINUX(2,6,23) ? 0 : 2)
 
 #define _SECTION_SIZE_BITS	28
 #define _MAX_PHYSMEM_BITS	32
@@ -3010,11 +3140,6 @@ typedef u64 pte_t;
 #define _64BIT_
 #define MACHINE_TYPE       "ARM64"    
 
-#define PTOV(X) \
-	((unsigned long)(X)-(machdep->machspec->phys_offset)+(machdep->machspec->page_offset))
-
-#define VTOP(X)               arm64_VTOP((ulong)(X))
-
 #define USERSPACE_TOP   (machdep->machspec->userspace_top)
 #define PAGE_OFFSET     (machdep->machspec->page_offset)
 #define VMALLOC_START   (machdep->machspec->vmalloc_start_addr)
@@ -3023,6 +3148,9 @@ typedef u64 pte_t;
 #define VMEMMAP_END     (machdep->machspec->vmemmap_end)
 #define MODULES_VADDR   (machdep->machspec->modules_vaddr)
 #define MODULES_END     (machdep->machspec->modules_end)
+
+#define PTOV(X)	arm64_PTOV((ulong)(X))
+#define VTOP(X)	arm64_VTOP((ulong)(X))
 
 #define IS_VMALLOC_ADDR(X)    arm64_IS_VMALLOC_ADDR((ulong)(X))
 
@@ -3132,6 +3260,9 @@ typedef signed int s32;
 #define NEW_VMEMMAP   (0x80)
 #define VM_L4_4K      (0x100)
 #define UNW_4_14      (0x200)
+#define FLIPPED_VM    (0x400)
+#define HAS_PHYSVIRT_OFFSET (0x800)
+#define OVERFLOW_STACKS     (0x1000)
 
 /*
  * Get kimage_voffset from /dev/crash
@@ -3151,8 +3282,8 @@ typedef signed int s32;
 
 #define ARM64_PAGE_OFFSET    ((0xffffffffffffffffUL) \
 					<< (machdep->machspec->VA_BITS - 1))
-#define ARM64_PAGE_OFFSET_ACTUAL ((0xffffffffffffffffUL) \
-					- ((1UL) << machdep->machspec->VA_BITS_ACTUAL) + 1)
+/* kernels >= v5.4 the kernel VA space is flipped */
+#define ARM64_FLIP_PAGE_OFFSET (-(1UL) << machdep->machspec->VA_BITS)
 
 #define ARM64_USERSPACE_TOP  ((1UL) << machdep->machspec->VA_BITS)
 #define ARM64_USERSPACE_TOP_ACTUAL  ((1UL) << machdep->machspec->VA_BITS_ACTUAL)
@@ -3174,8 +3305,11 @@ typedef signed int s32;
 
 #define ARM64_STACK_SIZE   (16384)
 #define ARM64_IRQ_STACK_SIZE   ARM64_STACK_SIZE
+#define ARM64_OVERFLOW_STACK_SIZE   (4096)
 
-#define _SECTION_SIZE_BITS      30
+#define _SECTION_SIZE_BITS           30
+#define _SECTION_SIZE_BITS_5_12      27
+#define _SECTION_SIZE_BITS_5_12_64K  29
 #define _MAX_PHYSMEM_BITS       40
 #define _MAX_PHYSMEM_BITS_3_17  48
 #define _MAX_PHYSMEM_BITS_52    52
@@ -3244,6 +3378,9 @@ struct machine_specific {
 	char  *irq_stackbuf;
 	ulong __irqentry_text_start;
 	ulong __irqentry_text_end;
+	ulong overflow_stack_size;
+	ulong *overflow_stacks;
+	char  *overflow_stackbuf;
 	/* for exception vector code */
 	ulong exp_entry1_start;
 	ulong exp_entry1_end;
@@ -3261,6 +3398,9 @@ struct machine_specific {
 	ulong VA_BITS_ACTUAL;
 	ulong CONFIG_ARM64_VA_BITS;
 	ulong VA_START;
+	ulong CONFIG_ARM64_KERNELPACMASK;
+	ulong physvirt_offset;
+	ulong struct_page_size;
 };
 
 struct arm64_stackframe {
@@ -3299,11 +3439,50 @@ struct arm64_stackframe {
 #define __swp_type(entry)	SWP_TYPE(entry)
 #define __swp_offset(entry)	SWP_OFFSET(entry)
 
-#define TIF_SIGPENDING		(2)
+#define TIF_SIGPENDING		(THIS_KERNEL_VERSION >= LINUX(2,6,23) ? 1 : 2)
 
 #define _SECTION_SIZE_BITS	26
 #define _MAX_PHYSMEM_BITS	32
 #endif  /* MIPS */
+
+#ifdef MIPS64
+#define _64BIT_
+#define MACHINE_TYPE		"MIPS64"
+
+#define PAGEBASE(X)		(((ulong)(X)) & (ulong)machdep->pagemask)
+#define IS_CKPHYS(X)		(((X) >= 0xffffffff80000000lu) && \
+				((X) < 0xffffffffc0000000lu))
+#define IS_XKPHYS(X)		(((X) >= 0x8000000000000000lu) && \
+				((X) < 0xc000000000000000lu))
+
+#define PTOV(X) 		((ulong)(X) + 0x9800000000000000lu)
+#define VTOP(X) 		(IS_CKPHYS(X) ? ((ulong)(X) & 0x000000001ffffffflu) \
+				: ((ulong)(X) & 0x0000fffffffffffflu))
+
+#define IS_VMALLOC_ADDR(X) (vt->vmalloc_start && (ulong)(X) >= vt->vmalloc_start && !IS_CKPHYS(X))
+
+#define DEFAULT_MODULES_VADDR   0xffffffffc0000000lu
+#define MODULES_VADDR           (machdep->machspec->modules_vaddr)
+#define MODULES_END             (machdep->machspec->modules_end)
+#define VMALLOC_START           (machdep->machspec->vmalloc_start_addr)
+#define VMALLOC_END             (machdep->machspec->vmalloc_end)
+
+#define __SWP_TYPE_SHIFT        16
+#define __SWP_TYPE_BITS         8
+#define __SWP_TYPE_MASK         ((1 << __SWP_TYPE_BITS) - 1)
+#define __SWP_OFFSET_SHIFT      (__SWP_TYPE_BITS + __SWP_TYPE_SHIFT)
+
+#define SWP_TYPE(entry)         (((entry) >> __SWP_TYPE_SHIFT) & __SWP_TYPE_MASK)
+#define SWP_OFFSET(entry)       ((entry) >> __SWP_OFFSET_SHIFT)
+
+#define __swp_type(entry)       SWP_TYPE(entry)
+#define __swp_offset(entry)     SWP_OFFSET(entry)
+
+#define TIF_SIGPENDING          (THIS_KERNEL_VERSION >= LINUX(2,6,23) ? 1 : 2)
+
+#define _SECTION_SIZE_BITS      28
+#define _MAX_PHYSMEM_BITS       48
+#endif  /* MIPS64 */
 
 #ifdef X86
 #define _32BIT_
@@ -3509,11 +3688,13 @@ struct arm64_stackframe {
 	    machdep->machspec->last_p4d_read = (ulong)(P4D);                  \
     }
 
+#define MAX_POSSIBLE_PHYSMEM_BITS     52
+
 /* 
  *  PHYSICAL_PAGE_MASK changed (enlarged) between 2.4 and 2.6, so
  *  for safety, use the 2.6 values to generate it.
  */ 
-#define __PHYSICAL_MASK_SHIFT_XEN     40
+#define __PHYSICAL_MASK_SHIFT_XEN     52
 #define __PHYSICAL_MASK_SHIFT_2_6     46
 #define __PHYSICAL_MASK_SHIFT_5LEVEL  52
 #define __PHYSICAL_MASK_SHIFT  (machdep->machspec->physical_mask_shift)
@@ -3765,7 +3946,7 @@ struct machine_specific {
 #define __swp_type(entry)   SWP_TYPE(entry)
 #define __swp_offset(entry) SWP_OFFSET(entry)
 
-#define TIF_SIGPENDING (2)
+#define TIF_SIGPENDING (THIS_KERNEL_VERSION >= LINUX(2,6,23) ? 1 : 2)
 
 #define _SECTION_SIZE_BITS	24
 #define _MAX_PHYSMEM_BITS	44
@@ -3960,7 +4141,7 @@ struct efi_memory_desc_t {
 #define __swp_type(entry)    ((entry >> 2) & 0x7f)
 #define __swp_offset(entry)  ((entry << 1) >> 10)
 
-#define TIF_SIGPENDING (1)
+#define TIF_SIGPENDING (THIS_KERNEL_VERSION >= LINUX(2,6,23) ? 0 : 1)
 
 #define KERNEL_TR_PAGE_SIZE (1 << _PAGE_SIZE_64M)
 #define KERNEL_TR_PAGE_MASK (~(KERNEL_TR_PAGE_SIZE - 1))
@@ -4100,7 +4281,7 @@ struct efi_memory_desc_t {
 #define PTE_RPN_MASK    (machdep->machspec->pte_rpn_mask)
 #define PTE_RPN_SHIFT   (machdep->machspec->pte_rpn_shift)
 
-#define TIF_SIGPENDING (2)
+#define TIF_SIGPENDING (THIS_KERNEL_VERSION >= LINUX(2,6,23) ? 1 : 2)
 
 #define SWP_TYPE(entry) (((entry) >> 1) & 0x7f)
 #define SWP_OFFSET(entry) ((entry) >> 8)
@@ -4140,7 +4321,7 @@ struct efi_memory_desc_t {
 #define __swp_type(entry)   SWP_TYPE(entry)
 #define __swp_offset(entry) SWP_OFFSET(entry)
 
-#define TIF_SIGPENDING (2)
+#define TIF_SIGPENDING (THIS_KERNEL_VERSION >= LINUX(3,16,0) ? 1 : 2)
 
 #define _SECTION_SIZE_BITS	25
 #define _MAX_PHYSMEM_BITS	31
@@ -4165,7 +4346,7 @@ struct efi_memory_desc_t {
 #define __swp_type(entry)  SWP_TYPE(entry)
 #define __swp_offset(entry) SWP_OFFSET(entry)
 
-#define TIF_SIGPENDING (2)
+#define TIF_SIGPENDING (THIS_KERNEL_VERSION >= LINUX(3,16,0) ? 1 : 2)
 
 #define _SECTION_SIZE_BITS	28
 #define _MAX_PHYSMEM_BITS_OLD	42
@@ -4343,6 +4524,10 @@ struct machine_specific {
 #define MAX_HEXADDR_STRLEN (8)
 #define UVADDR_PRLEN       (8)
 #endif
+#ifdef MIPS64
+#define MAX_HEXADDR_STRLEN (16)
+#define UVADDR_PRLEN       (16)
+#endif
 #ifdef SPARC64
 #define MAX_HEXADDR_STRLEN (16)
 #define UVADDR_PRLEN      (16)
@@ -4359,6 +4544,26 @@ struct machine_specific {
 #define NUM_TO_BIT(x) (1UL<<((x)%BITS_PER_LONG))
 #define NUM_IN_BITMAP(bitmap, x) (bitmap[(x)/BITS_PER_LONG] & NUM_TO_BIT(x))
 #define SET_BIT(bitmap, x) (bitmap[(x)/BITS_PER_LONG] |= NUM_TO_BIT(x))
+
+static inline unsigned int __const_hweight8(unsigned long w)
+{
+	return
+		(!!((w) & (1ULL << 0))) +
+		(!!((w) & (1ULL << 1))) +
+		(!!((w) & (1ULL << 2))) +
+		(!!((w) & (1ULL << 3))) +
+		(!!((w) & (1ULL << 4))) +
+		(!!((w) & (1ULL << 5))) +
+		(!!((w) & (1ULL << 6))) +
+		(!!((w) & (1ULL << 7)));
+}
+
+#define __const_hweight16(w) (__const_hweight8(w)  + __const_hweight8((w)  >> 8))
+#define __const_hweight32(w) (__const_hweight16(w) + __const_hweight16((w) >> 16))
+#define __const_hweight64(w) (__const_hweight32(w) + __const_hweight32((w) >> 32))
+
+#define hweight32(w) __const_hweight32(w)
+#define hweight64(w) __const_hweight64(w)
 
 /*
  *  precision lengths for fprintf
@@ -4591,7 +4796,7 @@ struct gnu_request {
 	long member_length;
 	int member_typecode;
 	long value;
-	char *tagname;
+	const char *tagname;
 	ulong pc;
 	ulong sp;
 	ulong ra;
@@ -4603,13 +4808,10 @@ struct gnu_request {
 	ulong task;
 	ulong debug;
 	struct stack_hook *hookp;
-	struct global_iterator {
-    		int finished; 
-		int block_index;
-    		struct symtab *symtab;
-    		struct symbol *sym;
-    		struct objfile *obj;
-  	} global_iterator;
+        ulong lowest;
+        ulong highest;
+        void (*callback) (struct gnu_request *req, void *data);
+        void *callback_data;
 	struct load_module *lm;
 	char *member_main_type_name;
 	char *member_main_type_tag_name;
@@ -4639,7 +4841,7 @@ struct gnu_request {
 #define GNU_USER_PRINT_OPTION       (16)
 #define GNU_SET_CRASH_BLOCK         (17)
 #define GNU_GET_FUNCTION_RANGE      (18)
-#define GNU_GET_NEXT_DATATYPE       (19)
+#define GNU_ITERATE_DATATYPES       (19)
 #define GNU_LOOKUP_STRUCT_CONTENTS  (20)
 #define GNU_DEBUG_COMMAND           (100)
 /*
@@ -4664,14 +4866,15 @@ struct gnu_request {
 /*
  *  function prototypes required by modified gdb source files.
  */
-int console(char *, ...);
-int gdb_CRASHDEBUG(ulong);
+extern "C" int console(const char *, ...);
+extern "C" int gdb_CRASHDEBUG(ulong);
 int gdb_readmem_callback(ulong, void *, int, int);
 void patch_load_module(struct objfile *objfile, struct minimal_symbol *msymbol);
-int patch_kernel_symbol(struct gnu_request *);
+extern "C" int patch_kernel_symbol(struct gnu_request *);
 struct syment *symbol_search(char *);
 int gdb_line_number_callback(ulong, ulong, ulong);
 int gdb_print_callback(ulong);
+extern "C" int same_file(char *, char *);
 #endif
 
 #ifndef GDB_COMMON
@@ -4685,8 +4888,8 @@ enum type_code {
   TYPE_CODE_STRUCT,             /* C struct or Pascal record */
   TYPE_CODE_UNION,              /* C union or Pascal variant part */
   TYPE_CODE_ENUM,               /* Enumeration type */
-#if defined(GDB_5_3) || defined(GDB_6_0) || defined(GDB_6_1) || defined(GDB_7_0) || defined(GDB_7_3_1) || defined(GDB_7_6)
-#if defined(GDB_7_0) || defined(GDB_7_3_1) || defined(GDB_7_6)
+#if defined(GDB_5_3) || defined(GDB_6_0) || defined(GDB_6_1) || defined(GDB_7_0) || defined(GDB_7_3_1) || defined(GDB_7_6) || defined(GDB_10_2)
+#if defined(GDB_7_0) || defined(GDB_7_3_1) || defined(GDB_7_6) || defined(GDB_10_2)
   TYPE_CODE_FLAGS,              /* Bit flags type */
 #endif
   TYPE_CODE_FUNC,               /* Function type */
@@ -4824,6 +5027,7 @@ void cmd_mach(void);         /* main.c */
 void cmd_help(void);         /* help.c */
 void cmd_test(void);         /* test.c */
 void cmd_ascii(void);        /* tools.c */
+void cmd_sbitmapq(void);     /* sbitmap.c */
 void cmd_bpf(void);          /* bfp.c */
 void cmd_set(void);          /* tools.c */
 void cmd_eval(void);         /* tools.c */
@@ -4919,6 +5123,9 @@ void dump_build_data(void);
 #ifdef MIPS
 #define machdep_init(X) mips_init(X)
 #endif
+#ifdef MIPS64
+#define machdep_init(X) mips64_init(X)
+#endif
 #ifdef SPARC64
 #define machdep_init(X) sparc64_init(X)
 #endif
@@ -4960,7 +5167,7 @@ void exec_args_input_file(struct command_table_entry *, struct args_input_file *
 FILE *set_error(char *);
 int __error(int, char *, ...);
 #define error __error               /* avoid conflict with gdb error() */
-int console(char *, ...);
+int console(const char *, ...);
 void create_console_device(char *);
 int console_off(void);
 int console_on(int);
@@ -5071,6 +5278,7 @@ char *strdupbuf(char *);
 void sigsetup(int, void *, struct sigaction *, struct sigaction *);
 #define SIGACTION(s, h, a, o) sigsetup(s, h, a, o)
 char *convert_time(ulonglong, char *);
+char *ctime_tz(time_t *);
 void stall(ulong);
 char *pages_to_size(ulong, char *);
 int clean_arg(void);
@@ -5189,10 +5397,6 @@ char *load_module_filter(char *, int);
 long datatype_info(char *, char *, struct datatype_member *);
 int get_symbol_type(char *, char *, struct gnu_request *);
 int get_symbol_length(char *);
-int text_value_cache(ulong, uint32_t, uint32_t *);
-int text_value_cache_byte(ulong, unsigned char *);
-void dump_text_value_cache(int);
-void clear_text_value_cache(void);
 void dump_numargs_cache(void);
 int patch_kernel_symbol(struct gnu_request *);
 struct syment *generic_machdep_value_to_symbol(ulong, ulong *);
@@ -5283,7 +5487,7 @@ int in_user_stack(ulong, ulong);
 int dump_inode_page(ulong);
 ulong valid_section_nr(ulong);
 void display_memory_from_file_offset(ulonglong, long, void *);
-
+void swap_info_init(void);
 
 /*
  *  filesys.c 
@@ -5349,9 +5553,7 @@ int file_dump(ulong, ulong, ulong, int, int);
 #define DUMP_DENTRY_ONLY    0x4
 #define DUMP_EMPTY_FILE     0x8
 #define DUMP_FILE_NRPAGES  0x10
-#endif  /* !GDB_COMMON */
 int same_file(char *, char *);
-#ifndef GDB_COMMON
 int cleanup_memory_driver(void);
 
 
@@ -5398,6 +5600,9 @@ void display_help_screen(char *);
 #ifdef MIPS
 #define dump_machdep_table(X) mips_dump_machdep_table(X)
 #endif
+#ifdef MIPS64
+#define dump_machdep_table(X) mips64_dump_machdep_table(X)
+#endif
 #ifdef SPARC64
 #define dump_machdep_table(X) sparc64_dump_machdep_table(X)
 #endif
@@ -5436,6 +5641,7 @@ extern char *help_rd[];
 extern char *help_repeat[];
 extern char *help_runq[];
 extern char *help_ipcs[];
+extern char *help_sbitmapq[];
 extern char *help_search[];
 extern char *help_set[];
 extern char *help_sig[];
@@ -5554,10 +5760,13 @@ void clone_bt_info(struct bt_info *, struct bt_info *, struct task_context *);
 void dump_kernel_table(int);
 void dump_bt_info(struct bt_info *, char *where);
 void dump_log(int);
+#define LOG_LEVEL(v) ((v) & 0x07)
 #define SHOW_LOG_LEVEL (0x1)
 #define SHOW_LOG_DICT  (0x2)
 #define SHOW_LOG_TEXT  (0x4)
 #define SHOW_LOG_AUDIT (0x8)
+#define SHOW_LOG_CTIME (0x10)
+#define SHOW_LOG_SAFE  (0x20)
 void set_cpu(int);
 void clear_machdep_cache(void);
 struct stack_hook *gather_text_list(struct bt_info *);
@@ -5634,6 +5843,8 @@ ulong cpu_map_addr(const char *type);
 #define BT_CPUMASK        (0x1000000000000ULL)
 #define BT_SHOW_ALL_REGS  (0x2000000000000ULL)
 #define BT_REGS_NOT_FOUND (0x4000000000000ULL)
+#define BT_OVERFLOW_STACK (0x8000000000000ULL)
+#define BT_SKIP_IDLE     (0x10000000000000ULL)
 #define BT_SYMBOL_OFFSET   (BT_SYMBOLIC_ARGS)
 
 #define BT_REF_HEXVAL         (0x1)
@@ -5702,6 +5913,40 @@ void devdump_info(void *, ulonglong, FILE *);
 void ipcs_init(void);
 ulong idr_find(ulong, int);
 
+/*
+ * sbitmap.c
+ */
+/* sbitmap helpers */
+struct sbitmap_context {
+	unsigned depth;
+	unsigned shift;
+	unsigned map_nr;
+	ulong map_addr;
+	ulong alloc_hint;
+	bool round_robin;
+};
+
+typedef bool (*sbitmap_for_each_fn)(unsigned int idx, void *p);
+
+void sbitmap_for_each_set(const struct sbitmap_context *sc,
+	sbitmap_for_each_fn fn, void *data);
+void sbitmap_context_load(ulong addr, struct sbitmap_context *sc);
+
+/* sbitmap_queue helpers */
+typedef bool (*sbitmapq_for_each_fn)(unsigned int idx, ulong addr, void *p);
+
+struct sbitmapq_ops {
+	/* array params associated with the bitmap */
+	ulong addr;
+	ulong size;
+	/* callback params */
+	sbitmapq_for_each_fn fn;
+	void *p;
+};
+
+void sbitmapq_init(void);
+void sbitmapq_for_each_set(ulong addr, struct sbitmapq_ops *ops);
+
 #ifdef ARM
 void arm_init(int);
 void arm_dump_machdep_table(ulong);
@@ -5768,6 +6013,7 @@ void unwind_backtrace(struct bt_info *);
 void arm64_init(int);
 void arm64_dump_machdep_table(ulong);
 ulong arm64_VTOP(ulong);
+ulong arm64_PTOV(ulong);
 int arm64_IS_VMALLOC_ADDR(ulong);
 ulong arm64_swp_type(ulong);
 ulong arm64_swp_offset(ulong);
@@ -5866,6 +6112,7 @@ struct x86_64_pt_regs_offsets {
 struct x86_64_stkinfo {
 	ulong ebase[NR_CPUS][MAX_EXCEPTION_STACKS];
 	int esize[MAX_EXCEPTION_STACKS];
+	char available[NR_CPUS][MAX_EXCEPTION_STACKS];
 	ulong ibase[NR_CPUS];
 	int isize;
 	int NMI_stack_index;
@@ -5950,6 +6197,7 @@ struct machine_specific {
 	ulong cpu_entry_area_start;
 	ulong cpu_entry_area_end;
 	ulong page_offset_force;
+	char **exception_functions;
 };
 
 #define KSYMS_START    (0x1)
@@ -5973,6 +6221,7 @@ struct machine_specific {
 #define VM_FLAGS (VM_ORIG|VM_2_6_11|VM_XEN|VM_XEN_RHEL4|VM_5LEVEL)
 
 #define _2MB_PAGE_MASK (~((MEGABYTES(2))-1))
+#define _1GB_PAGE_MASK (~((GIGABYTES(1))-1))
 
 #endif
 
@@ -6342,6 +6591,86 @@ struct machine_specific {
 #endif /* MIPS */
 
 /*
+ * mips64.c
+ */
+void mips64_display_regs_from_elf_notes(int, FILE *);
+
+#ifdef MIPS64
+void mips64_init(int);
+void mips64_dump_machdep_table(ulong);
+
+#define display_idt_table() \
+	error(FATAL, "-d option is not applicable to MIPS64 architecture\n")
+
+/* from arch/mips/include/asm/ptrace.h */
+struct mips64_register {
+	ulong regs[45];
+};
+
+struct mips64_pt_regs_main {
+	ulong regs[32];
+	ulong cp0_status;
+	ulong hi;
+	ulong lo;
+};
+
+struct mips64_pt_regs_cp0 {
+	ulong cp0_badvaddr;
+	ulong cp0_cause;
+	ulong cp0_epc;
+};
+
+struct mips64_unwind_frame {
+	unsigned long sp;
+	unsigned long pc;
+	unsigned long ra;
+};
+
+#define KSYMS_START	(0x1)
+
+struct machine_specific {
+	ulong phys_base;
+	ulong vmalloc_start_addr;
+	ulong modules_vaddr;
+	ulong modules_end;
+
+	ulong _page_present;
+	ulong _page_read;
+	ulong _page_write;
+	ulong _page_accessed;
+	ulong _page_modified;
+	ulong _page_huge;
+	ulong _page_special;
+	ulong _page_protnone;
+	ulong _page_global;
+	ulong _page_valid;
+	ulong _page_no_read;
+	ulong _page_no_exec;
+	ulong _page_dirty;
+
+	ulong _pfn_shift;
+
+	struct mips64_register *crash_task_regs;
+};
+/* from arch/mips/include/asm/pgtable-bits.h */
+#define _PAGE_PRESENT	(machdep->machspec->_page_present)
+#define _PAGE_READ	(machdep->machspec->_page_read)
+#define _PAGE_WRITE	(machdep->machspec->_page_write)
+#define _PAGE_ACCESSED	(machdep->machspec->_page_accessed)
+#define _PAGE_MODIFIED	(machdep->machspec->_page_modified)
+#define _PAGE_HUGE	(machdep->machspec->_page_huge)
+#define _PAGE_SPECIAL	(machdep->machspec->_page_special)
+#define _PAGE_PROTNONE	(machdep->machspec->_page_protnone)
+#define _PAGE_GLOBAL	(machdep->machspec->_page_global)
+#define _PAGE_VALID	(machdep->machspec->_page_valid)
+#define _PAGE_NO_READ	(machdep->machspec->_page_no_read)
+#define _PAGE_NO_EXEC	(machdep->machspec->_page_no_exec)
+#define _PAGE_DIRTY	(machdep->machspec->_page_dirty)
+#define _PFN_SHIFT	(machdep->machspec->_pfn_shift)
+
+#endif /* MIPS64 */
+
+/*
  * sparc64.c
  */
 #ifdef SPARC64
@@ -6409,6 +6738,7 @@ void display_ELF_note(int, int, void *, FILE *);
 void *netdump_get_prstatus_percpu(int);
 int kdump_kaslr_check(void);
 void display_vmcoredd_note(void *ptr, FILE *ofp);
+int kdump_get_nr_cpus(void);
 QEMUCPUState *kdump_get_qemucpustate(int);
 void kdump_device_dump_info(FILE *);
 void kdump_device_dump_extract(int, char *, FILE *);
@@ -6444,7 +6774,7 @@ FILE *set_diskdump_fp(FILE *);
 void get_diskdump_regs(struct bt_info *, ulong *, ulong *);
 int diskdump_phys_base(unsigned long *);
 int diskdump_set_phys_base(unsigned long);
-ulong *diskdump_flags;
+extern ulong *diskdump_flags;
 int is_partial_diskdump(void);
 int get_dump_level(void);
 int dumpfile_is_split(void);
@@ -6457,9 +6787,38 @@ void process_elf32_notes(void *, ulong);
 void process_elf64_notes(void *, ulong);
 void dump_registers_for_compressed_kdump(void);
 int diskdump_kaslr_check(void);
+int diskdump_get_nr_cpus(void);
 QEMUCPUState *diskdump_get_qemucpustate(int);
 void diskdump_device_dump_info(FILE *);
 void diskdump_device_dump_extract(int, char *, FILE *);
+ulong readswap(ulonglong pte_val, char *buf, ulong len, ulonglong vaddr);
+/*support for zram*/
+ulong try_zram_decompress(ulonglong pte_val, unsigned char *buf, ulong len, ulonglong vaddr);
+#define OBJ_TAG_BITS     1
+#ifndef MAX_POSSIBLE_PHYSMEM_BITS
+#define MAX_POSSIBLE_PHYSMEM_BITS (MAX_PHYSMEM_BITS())
+#endif
+#define _PFN_BITS        (MAX_POSSIBLE_PHYSMEM_BITS - PAGESHIFT())
+#define OBJ_INDEX_BITS   (BITS_PER_LONG - _PFN_BITS - OBJ_TAG_BITS)
+#define OBJ_INDEX_MASK   ((1 << OBJ_INDEX_BITS) - 1)
+#define ZS_HANDLE_SIZE   (sizeof(unsigned long))
+#define ZSPAGE_MAGIC     0x58
+#define SWAP_ADDRESS_SPACE_SHIFT	14
+#define SECTOR_SHIFT     9
+#define SECTORS_PER_PAGE_SHIFT  (PAGESHIFT() - SECTOR_SHIFT)
+#define SECTORS_PER_PAGE        (1 << SECTORS_PER_PAGE_SHIFT)
+#define ZRAM_FLAG_SHIFT         (1<<24)
+#define ZRAM_FLAG_SAME_BIT      (1<<25)
+struct zspage {
+    struct {
+        unsigned int fullness : 2;
+        unsigned int class : 9;
+        unsigned int isolated : 3;
+        unsigned int magic : 8;
+    };
+    unsigned int inuse;
+    unsigned int freeobj;
+};
 
 /*
  * makedumpfile.c
@@ -6546,7 +6905,8 @@ void sadump_unset_zero_excluded(void);
 struct sadump_data;
 struct sadump_data *get_sadump_data(void);
 int sadump_calc_kaslr_offset(ulong *);
-int sadump_get_cr3_idtr(ulong *, ulong *);
+int sadump_get_nr_cpus(void);
+int sadump_get_cr3_cr4_idtr(int, ulong *, ulong *, ulong *);
 
 /*
  * qemu.c
@@ -6599,14 +6959,28 @@ void get_vmware_vmss_regs(struct bt_info *, ulong *, ulong *);
 int vmware_vmss_memory_dump(FILE *);
 void dump_registers_for_vmss_dump(void);
 int vmware_vmss_valid_regs(struct bt_info *);
-int vmware_vmss_get_cr3_idtr(ulong *, ulong *);
+int vmware_vmss_get_nr_cpus(void);
+int vmware_vmss_get_cr3_cr4_idtr(int, ulong *, ulong *, ulong *);
 int vmware_vmss_phys_base(ulong *phys_base);
 int vmware_vmss_set_phys_base(ulong);
+int vmware_vmss_get_cpu_reg(int, int, const char *, int, void *);
+
+/*
+ * vmware_guestdump.c
+ */
+int is_vmware_guestdump(char *filename);
+int vmware_guestdump_init(char *filename, FILE *ofp);
+int vmware_guestdump_memory_dump(FILE *);
 
 /*
  * kaslr_helper.c
  */
 int calc_kaslr_offset(ulong *, ulong *);
+
+/*
+ * printk.c
+ */
+void dump_lockless_record_log(int);
 
 /*
  *  gnu_binutils.c
@@ -6909,10 +7283,10 @@ void gdb_readnow_warning(void);
 int gdb_set_crash_scope(ulong, char *);
 extern int *gdb_output_format;
 extern unsigned int *gdb_print_max;
-extern int *gdb_prettyprint_structs;
-extern int *gdb_prettyprint_arrays;
-extern int *gdb_repeat_count_threshold;
-extern int *gdb_stop_print_at_null;
+extern unsigned char *gdb_prettyprint_structs;
+extern unsigned char *gdb_prettyprint_arrays;
+extern unsigned int *gdb_repeat_count_threshold;
+extern unsigned char *gdb_stop_print_at_null;
 extern unsigned int *gdb_output_radix;
 
 /*
@@ -7013,5 +7387,54 @@ extern int have_full_symbols(void);
 #if defined(X86) || defined(X86_64) || defined(IA64)
 #define XEN_HYPERVISOR_ARCH 
 #endif
+
+/*
+ * Register numbers must be in sync with gdb/features/i386/64bit-core.c
+ * to make crash_target->fetch_registers() ---> machdep->get_cpu_reg()
+ * working properly.
+ */
+enum x86_64_regnum {
+        RAX_REGNUM,
+        RBX_REGNUM,
+        RCX_REGNUM,
+        RDX_REGNUM,
+        RSI_REGNUM,
+        RDI_REGNUM,
+        RBP_REGNUM,
+        RSP_REGNUM,
+        R8_REGNUM,
+        R9_REGNUM,
+        R10_REGNUM,
+        R11_REGNUM,
+        R12_REGNUM,
+        R13_REGNUM,
+        R14_REGNUM,
+        R15_REGNUM,
+        RIP_REGNUM,
+        EFLAGS_REGNUM,
+        CS_REGNUM,
+        SS_REGNUM,
+        DS_REGNUM,
+        ES_REGNUM,
+        FS_REGNUM,
+        GS_REGNUM,
+        ST0_REGNUM,
+        ST1_REGNUM,
+        ST2_REGNUM,
+        ST3_REGNUM,
+        ST4_REGNUM,
+        ST5_REGNUM,
+        ST6_REGNUM,
+        ST7_REGNUM,
+        FCTRL_REGNUM,
+        FSTAT_REGNUM,
+        FTAG_REGNUM,
+        FISEG_REGNUM,
+        FIOFF_REGNUM,
+        FOSEG_REGNUM,
+        FOOFF_REGNUM,
+        FOP_REGNUM,
+        LAST_REGNUM
+};
 
 #endif /* !GDB_COMMON */

@@ -18,6 +18,11 @@
 #include "defs.h"
 #include <ctype.h>
 
+#ifdef VALGRIND
+#include <valgrind/valgrind.h>
+#include <valgrind/memcheck.h>
+#endif
+
 static void print_number(struct number_option *, int, int);
 static long alloc_hq_entry(void);
 struct hq_entry;
@@ -1145,7 +1150,7 @@ extract_hex(char *s, ulong *result, char stripchar, ulong first_instance)
 	ulong value;
 	char *buf;
 
-	buf = GETBUF(strlen(s));
+	buf = GETBUF(strlen(s) + 1);
 	strcpy(buf, s);
 	argc = parse_line(buf, arglist);
 
@@ -3338,6 +3343,7 @@ void
 cmd_list(void)
 {
 	int c;
+	long head_member_offset = 0; /* offset for head like denty.d_subdirs */
 	struct list_data list_data, *ld;
 	struct datatype_member struct_member, *sm;
 	struct syment *sp;
@@ -3348,7 +3354,7 @@ cmd_list(void)
 	BZERO(ld, sizeof(struct list_data));
 	struct_list_offset = 0;
 
-	while ((c = getopt(argcnt, args, "BHhrs:S:e:o:xdl:")) != EOF) {
+	while ((c = getopt(argcnt, args, "BHhrs:S:e:o:O:xdl:")) != EOF) {
                 switch(c)
 		{
 		case 'B':
@@ -3387,6 +3393,20 @@ cmd_list(void)
 			else
 				error(FATAL, "invalid -l option: %s\n", 
 					optarg);
+			break;
+
+		case 'O':
+			if (ld->flags & LIST_HEAD_OFFSET_ENTERED)
+				error(FATAL, "offset value %d (0x%lx) already entered\n",
+					head_member_offset, head_member_offset);
+			else if (IS_A_NUMBER(optarg))
+				head_member_offset = stol(optarg, FAULT_ON_ERROR, NULL);
+			else if (arg_to_datatype(optarg, sm, RETURN_ON_ERROR) > 1)
+				head_member_offset = sm->member_offset;
+			else
+				error(FATAL, "invalid -O argument: %s\n", optarg);
+
+			ld->flags |= LIST_HEAD_OFFSET_ENTERED;
 			break;
 
 		case 'o':
@@ -3594,8 +3614,19 @@ next_arg:
 				fprintf(fp, "(empty)\n");
 				return;
 			}
-		} else
-			ld->start += ld->list_head_offset;
+		} else {
+			if (ld->flags & LIST_HEAD_OFFSET_ENTERED) {
+				if (!ld->end)
+					ld->end = ld->start + head_member_offset;
+				readmem(ld->start + head_member_offset, KVADDR, &ld->start,
+					sizeof(void *), "LIST_HEAD contents", FAULT_ON_ERROR);
+				if (ld->start == ld->end) {
+					fprintf(fp, "(empty)\n");
+					return;
+				}
+			} else
+				ld->start += ld->list_head_offset;
+		}
 	}
 
 	ld->flags &= ~(LIST_OFFSET_ENTERED|LIST_START_ENTERED);
@@ -4146,7 +4177,7 @@ do_list_no_hash(struct list_data *ld)
 			return -1;
 
 		if (!brent_loop_detect) {
-			if (brent_x == brent_y) {
+			if (count > 1 && brent_x == brent_y) {
 				brent_loop_detect = 1;
 				error(INFO, "loop detected, loop length: %ld\n", brent_lambda);
 				/* reset x and y to start; advance y loop length */
@@ -5679,8 +5710,21 @@ buf_init(void)
 
 	bp->smallest = 0x7fffffff; 
 	bp->total = 0.0;
-}
 
+#ifdef VALGRIND
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_1K, sizeof(bp->buf_1K));
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_2K, sizeof(bp->buf_2K));
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_4K, sizeof(bp->buf_4K));
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_8K, sizeof(bp->buf_8K));
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_32K, sizeof(bp->buf_32K));
+
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_1K, 0, 1);
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_2K, 0, 1);
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_4K, 0, 1);
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_8K, 0, 1);
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_32K, 0, 1);
+#endif
+}
 
 /*
  *  Free up all buffers used by the last command.
@@ -5707,6 +5751,26 @@ void free_all_bufs(void)
 	if (bp->mallocs != bp->frees)
 		error(WARNING, "malloc/free mismatch (%ld/%ld)\n",
 			bp->mallocs, bp->frees);
+
+#ifdef VALGRIND
+	VALGRIND_DESTROY_MEMPOOL(&bp->buf_1K);
+	VALGRIND_DESTROY_MEMPOOL(&bp->buf_2K);
+	VALGRIND_DESTROY_MEMPOOL(&bp->buf_4K);
+	VALGRIND_DESTROY_MEMPOOL(&bp->buf_8K);
+	VALGRIND_DESTROY_MEMPOOL(&bp->buf_32K);
+
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_1K, sizeof(bp->buf_1K));
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_2K, sizeof(bp->buf_2K));
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_4K, sizeof(bp->buf_4K));
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_8K, sizeof(bp->buf_8K));
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_32K, sizeof(bp->buf_32K));
+
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_1K, 0, 1);
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_2K, 0, 1);
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_4K, 0, 1);
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_8K, 0, 1);
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_32K, 0, 1);
+#endif
 }
 
 /*
@@ -5731,6 +5795,9 @@ freebuf(char *addr)
 	for (i = 0; i < NUMBER_1K_BUFS; i++) {
 		if (addr == (char *)&bp->buf_1K[i]) {
 			bp->buf_inuse[B1K] &= ~(1 << i);
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_FREE(&bp->buf_1K, addr);
+#endif
 			return;
 		}
 	}
@@ -5738,6 +5805,9 @@ freebuf(char *addr)
 	for (i = 0; i < NUMBER_2K_BUFS; i++) {
 		if (addr == (char *)&bp->buf_2K[i]) {
 			bp->buf_inuse[B2K] &= ~(1 << i);
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_FREE(&bp->buf_2K, addr);
+#endif
 			return;
 		}
 	}
@@ -5745,6 +5815,9 @@ freebuf(char *addr)
 	for (i = 0; i < NUMBER_4K_BUFS; i++) {
 		if (addr == (char *)&bp->buf_4K[i]) {
 			bp->buf_inuse[B4K] &= ~(1 << i);
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_FREE(&bp->buf_4K, addr);
+#endif
 			return;
 		}
 	}
@@ -5752,6 +5825,9 @@ freebuf(char *addr)
 	for (i = 0; i < NUMBER_8K_BUFS; i++) {
 		if (addr == (char *)&bp->buf_8K[i]) {
 			bp->buf_inuse[B8K] &= ~(1 << i);
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_FREE(&bp->buf_8K, addr);
+#endif
 			return;
 		}
 	}
@@ -5759,6 +5835,9 @@ freebuf(char *addr)
         for (i = 0; i < NUMBER_32K_BUFS; i++) {
                 if (addr == (char *)&bp->buf_32K[i]) {
                         bp->buf_inuse[B32K] &= ~(1 << i);
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_FREE(&bp->buf_32K, addr);
+#endif
                         return;
                 }
         }
@@ -5924,6 +6003,9 @@ getbuf(long reqsize)
                         bp->buf_inuse[B1K] |= (1 << bdx);
 			bp->buf_1K_maxuse = MAX(bp->buf_1K_maxuse, 
 				count_bits_int(bp->buf_inuse[B1K]));
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_ALLOC(&bp->buf_1K, bufp, 1024);
+#endif
                         BZERO(bufp, 1024);
                         return(bufp);
                 }
@@ -5938,6 +6020,9 @@ getbuf(long reqsize)
                         bp->buf_inuse[B2K] |= (1 << bdx);
                         bp->buf_2K_maxuse = MAX(bp->buf_2K_maxuse,
                                 count_bits_int(bp->buf_inuse[B2K]));
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_ALLOC(&bp->buf_2K, bufp, 2048);
+#endif
                         BZERO(bufp, 2048);
                         return(bufp);
                 }
@@ -5952,6 +6037,9 @@ getbuf(long reqsize)
                         bp->buf_inuse[B4K] |= (1 << bdx);
                         bp->buf_4K_maxuse = MAX(bp->buf_4K_maxuse,
                                 count_bits_int(bp->buf_inuse[B4K]));
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_ALLOC(&bp->buf_4K, bufp, 4096);
+#endif
                         BZERO(bufp, 4096);
                         return(bufp);
                 }
@@ -5966,6 +6054,9 @@ getbuf(long reqsize)
                         bp->buf_inuse[B8K] |= (1 << bdx);
                         bp->buf_8K_maxuse = MAX(bp->buf_8K_maxuse,
                                 count_bits_int(bp->buf_inuse[B8K]));
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_ALLOC(&bp->buf_8K, bufp, 8192);
+#endif
                         BZERO(bufp, 8192);
                         return(bufp);
                 }
@@ -5980,6 +6071,9 @@ getbuf(long reqsize)
                         bp->buf_inuse[B32K] |= (1 << bdx);
                         bp->buf_32K_maxuse = MAX(bp->buf_32K_maxuse,
                                 count_bits_int(bp->buf_inuse[B32K]));
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_ALLOC(&bp->buf_32K, bufp, 32768);
+#endif
                         BZERO(bufp, 32768);
                         return(bufp);
                 }
@@ -6145,7 +6239,7 @@ drop_core(char *s)
  *  The first time it's called, the device will be opened.
  */
 int
-console(char *fmt, ...)
+console(const char *fmt, ...)
 {
         char output[BUFSIZE*2];
 	va_list ap;
@@ -6318,6 +6412,38 @@ convert_time(ulonglong count, char *buf)
 }
 
 /*
+ * Convert a calendar time into a null-terminated string like ctime(), but
+ * the result string contains the time zone string and does not ends with a
+ * linefeed ('\n').  If localtime() or strftime() fails, fails back to return
+ * POSIX time (seconds since the Epoch) or ctime() string respectively.
+ *
+ * NOTE: The return value points to a statically allocated string which is
+ * overwritten by subsequent calls.
+ */
+char *
+ctime_tz(time_t *timep)
+{
+	static char buf[64];
+	struct tm *tm;
+	size_t size;
+
+	if (!timep)
+		return NULL;
+
+	tm = localtime(timep);
+	if (!tm) {
+		snprintf(buf, sizeof(buf), "%ld", *timep);
+		return buf;
+	}
+
+	size = strftime(buf, sizeof(buf), "%a %b %e %T %Z %Y", tm);
+	if (!size)
+		return strip_linefeeds(ctime(timep));
+
+	return buf;
+}
+
+/*
  *  Stall for a number of microseconds.
  */
 void
@@ -6339,7 +6465,7 @@ char *
 pages_to_size(ulong pages, char *buf)
 {
 	double total;
-	char *p1, *p2;
+	char *p;
 
 	if (pages == 0) {
 		sprintf(buf, "0");
@@ -6355,11 +6481,8 @@ pages_to_size(ulong pages, char *buf)
         else
         	sprintf(buf, "%ld KB", (ulong)(total/(double)KILOBYTES(1)));
 
-	if ((p1 = strstr(buf, ".0 "))) {
-		p2 = p1 + 3;
-		*p1++ = ' ';
-		strcpy(p1, p2);
-	}
+	if ((p = strstr(buf, ".0 ")))
+		memmove(p, p + 2, sizeof(" GB"));
 
 	return buf;
 }

@@ -23,6 +23,11 @@
 #include <ctype.h>
 #include <stdbool.h>
 #include "xendump.h"
+#if defined(GDB_7_6) || defined(GDB_10_2)
+#define __CONFIG_H__ 1
+#include "config.h"
+#endif
+#include "bfd.h"
 
 static void do_module_cmd(ulong, char *, ulong, char *, char *);
 static void show_module_taint(void);
@@ -53,7 +58,7 @@ static void dump_timer_data_timer_bases(const ulong *cpus);
 struct tv_range;
 static void init_tv_ranges(struct tv_range *, int, int, int);
 static int do_timer_list(ulong,int, ulong *, void *,ulong *, ulong *, struct tv_range *, ulong);
-static int do_timer_list_v3(ulong, int, ulong *, void *,ulong *, ulong *, ulong);
+static int do_timer_list_v3(ulong, int, ulong *, void *,ulong *, ulong *, ulong, long);
 struct timer_bases_data;
 static int do_timer_list_v4(struct timer_bases_data *, ulong);
 static int compare_timer_data(const void *, const void *);
@@ -93,8 +98,11 @@ static void source_tree_init(void);
 static ulong dump_audit_skb_queue(ulong);
 static ulong __dump_audit(char *);
 static void dump_audit(void);
+static void dump_printk_safe_seq_buf(int);
 static char *vmcoreinfo_read_string(const char *);
 static void check_vmcoreinfo(void);
+static int is_pvops_xen(void);
+static int get_linux_banner_from_vmlinux(char *, size_t);
 
 
 /*
@@ -109,7 +117,6 @@ kernel_init()
 	char *rqstruct;
 	char *rq_timestamp_name = NULL;
 	char *irq_desc_type_name;	
-	ulong pv_init_ops;
 	struct gnu_request req;
 
 	if (pc->flags & KERNEL_DEBUG_QUERY)
@@ -169,11 +176,7 @@ kernel_init()
                        	error(FATAL, "cannot malloc m2p page.");
 	}
 
-	if (PVOPS() && symbol_exists("pv_init_ops") &&
-	    readmem(symbol_value("pv_init_ops"), KVADDR, &pv_init_ops,
-	    sizeof(void *), "pv_init_ops", RETURN_ON_ERROR) &&
-	    (p1 = value_symbol(pv_init_ops)) && 
-	    STREQ(p1, "xen_patch")) {
+	if (is_pvops_xen()) {
 		kt->flags |= ARCH_XEN | ARCH_PVOPS_XEN;
 		kt->xen_flags |= WRITABLE_PAGE_TABLES;
 		if (machine_type("X86"))
@@ -225,22 +228,26 @@ kernel_init()
 	get_xtime(&kt->date);
 	if (CRASHDEBUG(1))
 		fprintf(fp, "xtime timespec.tv_sec: %lx: %s\n", 
-			kt->date.tv_sec, strip_linefeeds(ctime(&kt->date.tv_sec)));
+			kt->date.tv_sec, ctime_tz(&kt->date.tv_sec));
 	if (kt->flags2 & GET_TIMESTAMP) {
-		fprintf(fp, "%s\n\n", 
-			strip_linefeeds(ctime(&kt->date.tv_sec)));
+		fprintf(fp, "%s\n\n", ctime_tz(&kt->date.tv_sec));
 		clean_exit(0);
 	}
-	
+
+	MEMBER_OFFSET_INIT(uts_namespace_name, "uts_namespace", "name");
 	if (symbol_exists("system_utsname"))
         	readmem(symbol_value("system_utsname"), KVADDR, &kt->utsname,
                 	sizeof(struct new_utsname), "system_utsname", 
 			RETURN_ON_ERROR);
-	else if (symbol_exists("init_uts_ns"))
-		readmem(symbol_value("init_uts_ns") + sizeof(int),
-			KVADDR,  &kt->utsname, sizeof(struct new_utsname), 
+	else if (symbol_exists("init_uts_ns")) {
+		long offset = sizeof(int);
+		if (VALID_MEMBER(uts_namespace_name))
+			offset = OFFSET(uts_namespace_name);
+
+		readmem(symbol_value("init_uts_ns") + offset,
+			KVADDR,  &kt->utsname, sizeof(struct new_utsname),
 			"init_uts_ns", RETURN_ON_ERROR);
-	else
+	} else
 		error(INFO, "cannot access utsname information\n\n");
 
 	if (CRASHDEBUG(1)) {
@@ -550,6 +557,12 @@ kernel_init()
 		MEMBER_OFFSET_INIT(irq_desc_irq_data, "irq_desc", "irq_data");
 	}
 
+	STRUCT_SIZE_INIT(irq_common_data, "irq_common_data");
+	if (VALID_STRUCT(irq_common_data)) {
+		MEMBER_OFFSET_INIT(irq_common_data_affinity, "irq_common_data", "affinity");
+		MEMBER_OFFSET_INIT(irq_desc_irq_common_data, "irq_desc", "irq_common_data");
+	}
+
         STRUCT_SIZE_INIT(irq_cpustat_t, "irq_cpustat_t");
         MEMBER_OFFSET_INIT(irq_cpustat_t___softirq_active, 
                 "irq_cpustat_t", "__softirq_active");
@@ -605,7 +618,15 @@ kernel_init()
 		kt->flags |= TVEC_BASES_V1;
 
         STRUCT_SIZE_INIT(__wait_queue, "__wait_queue");
-        if (VALID_STRUCT(__wait_queue)) {
+	STRUCT_SIZE_INIT(wait_queue_entry, "wait_queue_entry");
+	if (VALID_STRUCT(wait_queue_entry)) {
+		MEMBER_OFFSET_INIT(wait_queue_entry_private,
+			"wait_queue_entry", "private");
+		MEMBER_OFFSET_INIT(wait_queue_head_head,
+			"wait_queue_head", "head");
+		MEMBER_OFFSET_INIT(wait_queue_entry_entry,
+			"wait_queue_entry", "entry");
+	} else if (VALID_STRUCT(__wait_queue)) {
 		if (MEMBER_EXISTS("__wait_queue", "task"))
 			MEMBER_OFFSET_INIT(__wait_queue_task,
 				"__wait_queue", "task");
@@ -783,7 +804,13 @@ kernel_init()
 		MEMBER_OFFSET_INIT(timerqueue_node_expires, 
 			"timerqueue_node", "expires");
 		MEMBER_OFFSET_INIT(timerqueue_node_node, 
-			"timerqueue_node_node", "node");
+			"timerqueue_node", "node");
+		if (INVALID_MEMBER(timerqueue_head_next)) {
+			MEMBER_OFFSET_INIT(timerqueue_head_rb_root,
+				"timerqueue_head", "rb_root");
+			MEMBER_OFFSET_INIT(rb_root_cached_rb_leftmost,
+				"rb_root_cached", "rb_leftmost");
+		}
 	}
 	MEMBER_OFFSET_INIT(hrtimer_softexpires, "hrtimer", "_softexpires");
 	MEMBER_OFFSET_INIT(hrtimer_function, "hrtimer", "function");
@@ -1033,6 +1060,7 @@ verify_version(void)
 	if (!(sp = symbol_search("linux_banner")))
 		error(FATAL, "linux_banner symbol does not exist?\n");
 	else if ((sp->type == 'R') || (sp->type == 'r') ||
+		(THIS_KERNEL_VERSION >= LINUX(2,6,11) && sp->type == 'D') ||
 		 (machine_type("ARM") && sp->type == 'T') ||
 		 (machine_type("ARM64")))
 		linux_banner = symbol_value("linux_banner");
@@ -1302,6 +1330,12 @@ verify_namelist()
 	target_smp = strstr(kt->utsname.version, " SMP ") ? TRUE : FALSE;
 	namelist_smp = FALSE;
 
+	if (get_linux_banner_from_vmlinux(buffer, sizeof(buffer)) &&
+	    strstr(buffer, kt->proc_version)) {
+		found = TRUE;
+		goto found;
+	}
+
         sprintf(command, "/usr/bin/strings %s", namelist);
         if ((pipe = popen(command, "r")) == NULL) {
                 error(INFO, "%s: %s\n", namelist, strerror(errno));
@@ -1362,6 +1396,7 @@ verify_namelist()
 		}
 	}
 
+found:
 	if (found) {
                 if (CRASHDEBUG(1)) {
                 	fprintf(fp, "verify_namelist:\n");
@@ -1453,11 +1488,18 @@ list_source_code(struct gnu_request *req, int count_entered)
         char *argv[MAXARGS];
 	struct syment *sp;
 	ulong remaining, offset;
+	struct load_module *lm;
 	char *p1;
 
 	sp = value_search(req->addr, &offset);
 	if (!sp || !is_symbol_text(sp))
 		error(FATAL, "%lx: not a kernel text address\n", req->addr);
+
+	if (module_symbol(req->addr, NULL, &lm, NULL, 0)) {
+		if (!(lm->mod_flags & MOD_LOAD_SYMS))
+			error(FATAL, "%s: module source code is not available\n", lm->mod_name);
+		get_line_number(req->addr, buf1, FALSE);
+	}
 
 	sprintf(buf1, "list *0x%lx", req->addr);
 	open_tmpfile();
@@ -2461,7 +2503,7 @@ cmd_bt(void)
 	if (kt->flags & USE_OPT_BT)
 		bt->flags |= BT_OPT_BACK_TRACE;
 
-	while ((c = getopt(argcnt, args, "D:fFI:S:c:aAloreEgstTdxR:Ovp")) != EOF) {
+	while ((c = getopt(argcnt, args, "D:fFI:S:c:n:aAloreEgstTdxR:Ovp")) != EOF) {
                 switch (c)
 		{
 		case 'f':
@@ -2628,6 +2670,14 @@ cmd_bt(void)
 			bt->flags |= BT_SHOW_ALL_REGS; /* FALLTHROUGH */
 		case 'a':
 			active++;
+			break;
+
+		case 'n':
+			if ((machine_type("X86_64") || machine_type("ARM64")) &&
+			    STREQ(optarg, "idle"))
+				bt->flags |= BT_SKIP_IDLE;
+			else
+				option_not_supported(c);
 			break;
 
 		case 'r':
@@ -3049,6 +3099,10 @@ back_trace(struct bt_info *bt)
 			machdep->get_stack_frame(bt, &eip, &esp);
 	} else
                 machdep->get_stack_frame(bt, &eip, &esp);
+
+	/* skip idle task stack */
+	if (bt->flags & BT_SKIP_IDLE)
+		return;
 
 	if (bt->flags & BT_KSTACKP) {
 		bt->stkptr = esp;
@@ -3526,6 +3580,62 @@ module_init(void)
 					   "module_core");
 			MEMBER_OFFSET_INIT(module_module_init, "module",
 					   "module_init");
+		} else if (MEMBER_EXISTS("module", "module_core_rx")) {
+			if (CRASHDEBUG(1))
+				error(INFO, "PaX module layout detected.\n");
+			kt->flags2 |= KMOD_PAX;
+
+			MEMBER_OFFSET_INIT(module_core_size_rw, "module",
+					   "core_size_rw");
+			MEMBER_OFFSET_INIT(module_core_size_rx, "module",
+					   "core_size_rx");
+
+			MEMBER_OFFSET_INIT(module_init_size_rw, "module",
+					   "init_size_rw");
+			MEMBER_OFFSET_INIT(module_init_size_rx, "module",
+					   "init_size_rx");
+
+			MEMBER_OFFSET_INIT(module_module_core_rw, "module",
+					   "module_core_rw");
+			MEMBER_OFFSET_INIT(module_module_core_rx, "module",
+					   "module_core_rx");
+
+			MEMBER_OFFSET_INIT(module_module_init_rw, "module",
+					   "module_init_rw");
+			MEMBER_OFFSET_INIT(module_module_init_rx, "module",
+					   "module_init_rx");
+		} else if (MEMBER_EXISTS("module_layout", "base_rx")) {
+			if (CRASHDEBUG(1))
+				error(INFO, "PaX module layout detected.\n");
+			kt->flags2 |= KMOD_PAX;
+
+			ASSIGN_OFFSET(module_core_size_rw) =
+				MEMBER_OFFSET("module", "core_layout") +
+				MEMBER_OFFSET("module_layout", "size_rw");
+			ASSIGN_OFFSET(module_core_size_rx) =
+				MEMBER_OFFSET("module", "core_layout") +
+				MEMBER_OFFSET("module_layout", "size_rx");
+
+			ASSIGN_OFFSET(module_init_size_rw) =
+				MEMBER_OFFSET("module", "init_layout") +
+				MEMBER_OFFSET("module_layout", "size_rw");
+			ASSIGN_OFFSET(module_init_size_rx) =
+				MEMBER_OFFSET("module", "init_layout") +
+				MEMBER_OFFSET("module_layout", "size_rx");
+
+			ASSIGN_OFFSET(module_module_core_rw) =
+				MEMBER_OFFSET("module", "core_layout") +
+				MEMBER_OFFSET("module_layout", "base_rw");
+			ASSIGN_OFFSET(module_module_core_rx) =
+				MEMBER_OFFSET("module", "core_layout") +
+				MEMBER_OFFSET("module_layout", "base_rx");
+
+			ASSIGN_OFFSET(module_module_init_rw) =
+				MEMBER_OFFSET("module", "init_layout") +
+				MEMBER_OFFSET("module_layout", "base_rw");
+			ASSIGN_OFFSET(module_module_init_rx) =
+				MEMBER_OFFSET("module", "init_layout") +
+				MEMBER_OFFSET("module_layout", "base_rx");
 		} else {
 			ASSIGN_OFFSET(module_core_size) =
 				MEMBER_OFFSET("module", "core_layout") +
@@ -3668,10 +3778,10 @@ module_init(void)
 		case KALLSYMS_V2:
 			if (THIS_KERNEL_VERSION >= LINUX(2,6,27)) {
 				numksyms = UINT(modbuf + OFFSET(module_num_symtab));
-				size = UINT(modbuf + OFFSET(module_core_size));
+				size = UINT(modbuf + MODULE_OFFSET2(module_core_size, rx));
 			} else {
 				numksyms = ULONG(modbuf + OFFSET(module_num_symtab));
-				size = ULONG(modbuf + OFFSET(module_core_size));
+				size = ULONG(modbuf + MODULE_OFFSET2(module_core_size, rx));
 			}
 
 			if (!size) {
@@ -3778,7 +3888,7 @@ verify_modules(void)
 				break;
 			case KMOD_V2:
 				mod_base = ULONG(modbuf + 
-					OFFSET(module_module_core));
+					MODULE_OFFSET2(module_module_core, rx));
 				break;
 			}
 
@@ -3802,10 +3912,10 @@ verify_modules(void)
 						OFFSET(module_name);
 					if (THIS_KERNEL_VERSION >= LINUX(2,6,27))
 						mod_size = UINT(modbuf +
-							OFFSET(module_core_size));
+							MODULE_OFFSET2(module_core_size, rx));
 					else
 						mod_size = ULONG(modbuf +
-							OFFSET(module_core_size));
+							MODULE_OFFSET2(module_core_size, rx));
                 			if (strlen(module_name) < MAX_MOD_NAME)
                         			strcpy(buf, module_name);
                 			else 
@@ -4393,6 +4503,7 @@ do_module_cmd(ulong flag, char *modref, ulong address,
 	char buf1[BUFSIZE];
 	char buf2[BUFSIZE];
 	char buf3[BUFSIZE];
+	char buf4[BUFSIZE];
 
 	if (NO_MODULES())
 		return;
@@ -4414,10 +4525,12 @@ do_module_cmd(ulong flag, char *modref, ulong address,
 	        }
 	
 		if (flag == LIST_MODULE_HDR) {
-			fprintf(fp, "%s  %s  %s  OBJECT FILE\n",
+			fprintf(fp, "%s  %s  %s  %s  OBJECT FILE\n",
 				mkstring(buf1, VADDR_PRLEN, CENTER|LJUST, 
 				"MODULE"),
 				mkstring(buf2, maxnamelen, LJUST, "NAME"),
+				mkstring(buf4, VADDR_PRLEN, CENTER|LJUST,
+				"BASE"),
 				mkstring(buf3, maxsizelen, RJUST, "SIZE"));
 		}
 	
@@ -4429,6 +4542,8 @@ do_module_cmd(ulong flag, char *modref, ulong address,
 				    LONG_HEX|RJUST, MKSTR(lm->module_struct)));
 				fprintf(fp, "%s  ", mkstring(buf2, maxnamelen, 
 					LJUST, lm->mod_name));
+				fprintf(fp, "%s  ", mkstring(buf4, VADDR_PRLEN,
+				    LONG_HEX|RJUST, MKSTR(lm->mod_base)));
 				fprintf(fp, "%s  ", mkstring(buf3, maxsizelen,
 					RJUST|LONG_DEC, MKSTR(lm->mod_size)));
 				// fprintf(fp, "%6ld  ", lm->mod_size);
@@ -4572,7 +4687,7 @@ reinit_modules(void)
         st->ext_module_symtable = NULL;
         st->load_modules = NULL;
         kt->mods_installed = 0;
-	clear_text_value_cache();
+	memset(st->mod_symname_hash, 0, sizeof(st->mod_symname_hash));
 
         module_init();
 }
@@ -4707,7 +4822,18 @@ module_objfile_search(char *modref, char *filename, char *tree)
 
 	sprintf(dir, "%s/%s", DEFAULT_REDHAT_DEBUG_LOCATION, 
 		kt->utsname.release);
-	retbuf = search_directory_tree(dir, file, 0);
+	if (!(retbuf = search_directory_tree(dir, file, 0))) {
+		switch (kt->flags & (KMOD_V1|KMOD_V2))
+		{
+		case KMOD_V2:
+			sprintf(file, "%s.ko", modref);
+			retbuf = search_directory_tree(dir, file, 0);
+			if (!retbuf) {
+				sprintf(file, "%s.ko.debug", modref);
+				retbuf = search_directory_tree(dir, file, 0);
+			}
+		}
+	}
 
 	if (!retbuf && (env = getenv("CRASH_MODULE_PATH"))) {
 		sprintf(dir, "%s", env);
@@ -4898,9 +5024,12 @@ cmd_log(void)
 
 	msg_flags = 0;
 
-        while ((c = getopt(argcnt, args, "tdma")) != EOF) {
+        while ((c = getopt(argcnt, args, "Ttdmas")) != EOF) {
                 switch(c)
                 {
+		case 'T':
+			msg_flags |= SHOW_LOG_CTIME;
+			break;
 		case 't':
 			msg_flags |= SHOW_LOG_TEXT;
 			break;
@@ -4913,6 +5042,9 @@ cmd_log(void)
 		case 'a':
 			msg_flags |= SHOW_LOG_AUDIT;
 			break;
+		case 's':
+			msg_flags |= SHOW_LOG_SAFE;
+			break;
                 default:
                         argerrs++;
                         break;
@@ -4922,12 +5054,23 @@ cmd_log(void)
         if (argerrs)
                 cmd_usage(pc->curcmd, SYNOPSIS);
 
+	if (msg_flags & SHOW_LOG_CTIME && pc->flags & MINIMAL_MODE) {
+		error(WARNING, "the option '-T' is not available in minimal mode\n");
+		return;
+	}
+
 	if (msg_flags & SHOW_LOG_AUDIT) {
 		dump_audit();
 		return;
 	}
 
+	if (msg_flags & SHOW_LOG_SAFE) {
+		dump_printk_safe_seq_buf(msg_flags);
+		return;
+	}
+
 	dump_log(msg_flags);
+	dump_printk_safe_seq_buf(msg_flags);
 }
 
 
@@ -4942,12 +5085,19 @@ dump_log(int msg_flags)
 	struct syment *nsp;
 	int log_wrap, loglevel, log_buf_len;
 
+	if (kernel_symbol_exists("prb")) {
+		dump_lockless_record_log(msg_flags);
+		return;
+	}
+
 	if (kernel_symbol_exists("log_first_idx") && 
 	    kernel_symbol_exists("log_next_idx")) {
 		dump_variable_length_record_log(msg_flags);
 		return;
 	}
 
+	if (msg_flags & SHOW_LOG_CTIME)
+		option_not_supported('T');
 	if (msg_flags & SHOW_LOG_DICT)
 		option_not_supported('d');
 	if ((msg_flags & SHOW_LOG_TEXT) && STREQ(pc->curcmd, "log"))
@@ -4979,6 +5129,10 @@ dump_log(int msg_flags)
 	if ((len = get_symbol_length("log_end")) == sizeof(int)) {
 		get_symbol_data("log_end", len, &tmp);
 		log_end = (ulong)tmp;
+	} else if (len == 0) {
+		THIS_KERNEL_VERSION >= LINUX(2,6,25) ?
+			get_symbol_data("log_end", sizeof(unsigned), &log_end) :
+			get_symbol_data("log_end", sizeof(unsigned long), &log_end);
 	} else
 		get_symbol_data("log_end", len, &log_end);
 
@@ -5140,10 +5294,17 @@ dump_log_entry(char *logptr, int msg_flags)
 	if ((msg_flags & SHOW_LOG_TEXT) == 0) {
 		nanos = (ulonglong)ts_nsec / (ulonglong)1000000000;
 		rem = (ulonglong)ts_nsec % (ulonglong)1000000000;
-		sprintf(buf, "[%5lld.%06ld] ", nanos, rem/1000);
+		if (msg_flags & SHOW_LOG_CTIME) {
+			time_t t = kt->boot_date.tv_sec + nanos;
+			sprintf(buf, "[%s] ", ctime_tz(&t));
+		}
+		else
+			sprintf(buf, "[%5lld.%06ld] ", nanos, rem/1000);
 		ilen = strlen(buf);
 		fprintf(fp, "%s", buf);
 	}
+
+	level = LOG_LEVEL(level);
 
 	if (msg_flags & SHOW_LOG_LEVEL) {
 		sprintf(buf, "<%x>", level);
@@ -5182,7 +5343,7 @@ dump_log_entry(char *logptr, int msg_flags)
 }
 
 /* 
- *  Handle the new variable-length-record log_buf.
+ *  Handle the variable-length-record log_buf.
  */
 static void
 dump_variable_length_record_log(int msg_flags)
@@ -5264,8 +5425,12 @@ dump_variable_length_record_log(int msg_flags)
 		idx = log_next(idx, logbuf);
 
 		if (idx >= log_buf_len) {
-			error(INFO, "\ninvalid log_buf entry encountered\n");
-			break;
+			if (log_first_idx > log_next_idx)
+				idx = 0;
+			else {
+				error(INFO, "\ninvalid log_buf entry encountered\n");
+				break;
+			}
 		}
 
 		if (CRASHDEBUG(1) && (idx == log_next_idx))
@@ -5336,9 +5501,27 @@ cmd_sys(void)
 		else if (STREQ(args[optind], "config"))
 			read_in_kernel_config(IKCFG_READ);
                 else
-                        cmd_usage(args[optind], COMPLETE_HELP);
+                        cmd_usage(pc->curcmd, SYNOPSIS);
                 optind++;
         } while (args[optind]);
+}
+
+static int
+is_kernel_tainted(void)
+{
+	ulong tainted_mask;
+	int tainted;
+
+	if (kernel_symbol_exists("tainted")) {
+		get_symbol_data("tainted", sizeof(int), &tainted);
+		if (tainted)
+			return TRUE;
+	} else if (kernel_symbol_exists("tainted_mask")) {
+		get_symbol_data("tainted_mask", sizeof(ulong), &tainted_mask);
+		if (tainted_mask)
+			return TRUE;
+	}
+	return FALSE;
 }
 
 static int
@@ -5404,16 +5587,18 @@ display_sys_stats(void)
 		}
 	} else {
         	if (pc->system_map) {
-                	fprintf(fp, "  SYSTEM MAP: %s%s\n", pc->system_map,
-				is_livepatch() ? "  [LIVEPATCH]" : "");
+			fprintf(fp, "  SYSTEM MAP: %s%s%s\n", pc->system_map,
+				is_livepatch() ? "  [LIVEPATCH]" : "",
+				is_kernel_tainted() ? "  [TAINTED]" : "");
 			fprintf(fp, "DEBUG KERNEL: %s %s\n", 
 					pc->namelist_orig ?
 					pc->namelist_orig : pc->namelist,
 					debug_kernel_version(pc->namelist));
 		} else
-			fprintf(fp, "      KERNEL: %s%s\n", pc->namelist_orig ? 
+			fprintf(fp, "      KERNEL: %s%s%s\n", pc->namelist_orig ?
 				pc->namelist_orig : pc->namelist,
-				is_livepatch() ? "  [LIVEPATCH]" : "");
+				is_livepatch() ? "  [LIVEPATCH]" : "",
+				is_kernel_tainted() ? "  [TAINTED]" : "");
 	}
 
 	if (pc->debuginfo_file) { 
@@ -5508,8 +5693,7 @@ display_sys_stats(void)
 
 	if (ACTIVE())
 		get_xtime(&kt->date);
-        fprintf(fp, "        DATE: %s\n", 
-		strip_linefeeds(ctime(&kt->date.tv_sec))); 
+        fprintf(fp, "        DATE: %s\n", ctime_tz(&kt->date.tv_sec));
         fprintf(fp, "      UPTIME: %s\n", get_uptime(buf, NULL)); 
         fprintf(fp, "LOAD AVERAGE: %s\n", get_loadavg(buf)); 
 	fprintf(fp, "       TASKS: %ld\n", RUNNING_TASKS());
@@ -5952,6 +6136,8 @@ dump_kernel_table(int verbose)
 		fprintf(fp, "%sIRQ_DESC_TREE_RADIX", others++ ? "|" : "");
 	if (kt->flags2 & IRQ_DESC_TREE_XARRAY)
 		fprintf(fp, "%sIRQ_DESC_TREE_XARRAY", others++ ? "|" : "");
+	if (kt->flags2 & KMOD_PAX)
+		fprintf(fp, "%sKMOD_PAX", others++ ? "|" : "");
 	fprintf(fp, ")\n");
 
         fprintf(fp, "         stext: %lx\n", kt->stext);
@@ -5998,8 +6184,8 @@ dump_kernel_table(int verbose)
 		kt->source_tree : "(not used)");
 	if (!(pc->flags & KERNEL_DEBUG_QUERY) && ACTIVE()) 
 		get_xtime(&kt->date);
-        fprintf(fp, "          date: %s\n",
-                strip_linefeeds(ctime(&kt->date.tv_sec)));
+        fprintf(fp, "          date: %s\n", ctime_tz(&kt->date.tv_sec));
+        fprintf(fp, "     boot_date: %s\n", ctime_tz(&kt->boot_date.tv_sec));
         fprintf(fp, "  proc_version: %s\n", strip_linefeeds(kt->proc_version));
         fprintf(fp, "   new_utsname: \n");
         fprintf(fp, "      .sysname: %s\n", uts->sysname);
@@ -6292,10 +6478,9 @@ cmd_irq(void)
 			if (!machdep->get_irq_affinity)
 				option_not_supported(c);
 
-			if (VALID_STRUCT(irq_data)) {
-				if (INVALID_MEMBER(irq_data_affinity))
-					option_not_supported(c);
-			} else if (INVALID_MEMBER(irq_desc_t_affinity))
+			if (INVALID_MEMBER(irq_data_affinity) &&
+			    INVALID_MEMBER(irq_common_data_affinity) &&
+			    INVALID_MEMBER(irq_desc_t_affinity))
 				option_not_supported(c);
 
 			if ((nr_irqs = machdep->nr_irqs) == 0)
@@ -7057,7 +7242,10 @@ generic_get_irq_affinity(int irq)
 		len = DIV_ROUND_UP(kt->cpus, BITS_PER_LONG) * sizeof(ulong);
 
 	affinity = (ulong *)GETBUF(len);
-	if (VALID_STRUCT(irq_data))
+	if (VALID_MEMBER(irq_common_data_affinity))
+		tmp_addr = irq_desc_addr + OFFSET(irq_desc_irq_common_data)
+				+ OFFSET(irq_common_data_affinity);
+	else if (VALID_MEMBER(irq_data_affinity))
 		tmp_addr = irq_desc_addr + \
 			   OFFSET(irq_data_affinity);
 	else
@@ -7510,7 +7698,8 @@ dump_hrtimer_data(const ulong *cpus)
 	if (VALID_STRUCT(hrtimer_clock_base)) {
 		hrtimer_max_clock_bases = 2;
 		if (symbol_exists("ktime_get_boottime"))
-			hrtimer_max_clock_bases = 3;
+			hrtimer_max_clock_bases = MEMBER_SIZE("hrtimer_cpu_base", "clock_base") /
+							SIZE(hrtimer_clock_base);
 	} else if (VALID_STRUCT(hrtimer_base)) {
 		max_hrtimer_bases = 2;
 	} else
@@ -7647,11 +7836,17 @@ next_one:
 		readmem((ulong)(base + OFFSET(hrtimer_clock_base_first)),
 			KVADDR,	&curr, sizeof(curr), "hrtimer_clock_base first",
 			FAULT_ON_ERROR);
-	else
+	else if (VALID_MEMBER(timerqueue_head_next))
 		readmem((ulong)(base + OFFSET(hrtimer_clock_base_active) +
 				OFFSET(timerqueue_head_next)),
 			KVADDR, &curr, sizeof(curr), "hrtimer_clock base",
 			FAULT_ON_ERROR);
+	else
+		readmem((ulong)(base + OFFSET(hrtimer_clock_base_active) +
+				OFFSET(timerqueue_head_rb_root) +
+				OFFSET(rb_root_cached_rb_leftmost)),
+			KVADDR, &curr, sizeof(curr),
+			"hrtimer_clock_base active", FAULT_ON_ERROR);
 
 	while (curr && i < next) {
 		curr = rb_next(curr);
@@ -8376,7 +8571,12 @@ dump_timer_data_tvec_bases_v3(const ulong *cpus)
 	char buf4[BUFSIZE];
 
 	vec_root_size = vec_size = 0;
-	head_size = SIZE(hlist_head);
+
+	if (STREQ(MEMBER_TYPE_NAME("tvec_root", "vec"), "list_head"))
+		/* for RHEL7.6 or later */
+		head_size = SIZE(list_head);
+	else
+		head_size = SIZE(hlist_head);
 
 	if ((i = get_array_length("tvec_root.vec", NULL, head_size)))
 		vec_root_size = i;
@@ -8414,15 +8614,15 @@ next_cpu:
 	init_tv_ranges(tv, vec_root_size, vec_size, cpu);
 
 	count += do_timer_list_v3(tv[1].base + OFFSET(tvec_root_s_vec),
-		vec_root_size, vec, NULL, NULL, NULL, 0);
+		vec_root_size, vec, NULL, NULL, NULL, 0, head_size);
 	count += do_timer_list_v3(tv[2].base + OFFSET(tvec_s_vec),
-		vec_size, vec, NULL, NULL, NULL, 0);
+		vec_size, vec, NULL, NULL, NULL, 0, head_size);
 	count += do_timer_list_v3(tv[3].base + OFFSET(tvec_s_vec),
-		vec_size, vec, NULL, NULL, NULL, 0);
+		vec_size, vec, NULL, NULL, NULL, 0, head_size);
 	count += do_timer_list_v3(tv[4].base + OFFSET(tvec_s_vec),
-		vec_size, vec, NULL, NULL, NULL, 0);
+		vec_size, vec, NULL, NULL, NULL, 0, head_size);
 	count += do_timer_list_v3(tv[5].base + OFFSET(tvec_s_vec),
-		vec_size, vec, NULL, NULL, NULL, 0);
+		vec_size, vec, NULL, NULL, NULL, 0, head_size);
 
 	if (count)
 		td = (struct timer_data *)
@@ -8433,16 +8633,16 @@ next_cpu:
 
 	get_symbol_data("jiffies", sizeof(ulong), &jiffies);
 
-	do_timer_list_v3(tv[1].base + OFFSET(tvec_root_s_vec),
-		vec_root_size, vec, (void *)td, &highest, &highest_tte, jiffies);
-	do_timer_list_v3(tv[2].base + OFFSET(tvec_s_vec),
-		vec_size, vec, (void *)td, &highest, &highest_tte, jiffies);
-	do_timer_list_v3(tv[3].base + OFFSET(tvec_s_vec),
-		vec_size, vec, (void *)td, &highest, &highest_tte, jiffies);
-	do_timer_list_v3(tv[4].base + OFFSET(tvec_s_vec),
-		vec_size, vec, (void *)td, &highest, &highest_tte, jiffies);
-	tdx = do_timer_list_v3(tv[5].base + OFFSET(tvec_s_vec),
-		vec_size, vec, (void *)td, &highest, &highest_tte, jiffies);
+	do_timer_list_v3(tv[1].base + OFFSET(tvec_root_s_vec), vec_root_size,
+		vec, (void *)td, &highest, &highest_tte, jiffies, head_size);
+	do_timer_list_v3(tv[2].base + OFFSET(tvec_s_vec), vec_size,
+		vec, (void *)td, &highest, &highest_tte, jiffies, head_size);
+	do_timer_list_v3(tv[3].base + OFFSET(tvec_s_vec), vec_size,
+		vec, (void *)td, &highest, &highest_tte, jiffies, head_size);
+	do_timer_list_v3(tv[4].base + OFFSET(tvec_s_vec), vec_size,
+		vec, (void *)td, &highest, &highest_tte, jiffies, head_size);
+	tdx = do_timer_list_v3(tv[5].base + OFFSET(tvec_s_vec), vec_size,
+		vec, (void *)td, &highest, &highest_tte, jiffies, head_size);
 
 	qsort(td, tdx, sizeof(struct timer_data), compare_timer_data);
 
@@ -8786,7 +8986,8 @@ do_timer_list_v3(ulong vec_kvaddr,
 	      void *option, 
 	      ulong *highest,
 	      ulong *highest_tte,
-	      ulong jiffies)
+	      ulong jiffies,
+	      long head_size)
 {
 	int i, t; 
 	int count, tdx;
@@ -8804,19 +9005,24 @@ do_timer_list_v3(ulong vec_kvaddr,
 			tdx++;
 	}
 
-	readmem(vec_kvaddr, KVADDR, vec, SIZE(hlist_head) * size, 
+	readmem(vec_kvaddr, KVADDR, vec, head_size * size,
 		"timer_list vec array", FAULT_ON_ERROR);
 
 	ld = &list_data;
 	timer_list_buf = GETBUF(SIZE(timer_list));
 
-	for (i = count = 0; i < size; i++, vec_kvaddr += SIZE(hlist_head)) {
+	for (i = count = 0; i < size; i++, vec_kvaddr += head_size) {
 
-		if (vec[i] == 0)
-			continue;
+		if (head_size == SIZE(list_head)) {
+			if (vec[i*2] == vec_kvaddr)
+				continue;
+		} else {
+			if (vec[i] == 0)
+				continue;
+		}
 
 		BZERO(ld, sizeof(struct list_data));
-		ld->start = vec[i];
+		ld->start = (head_size == SIZE(list_head)) ? vec[i*2] : vec[i];
 		ld->list_head_offset = OFFSET(timer_list_entry);
 		ld->end = vec_kvaddr;
 		ld->flags = RETURN_ON_LIST_ERROR;
@@ -9224,9 +9430,9 @@ dump_waitq(ulong wq, char *wq_name)
 	struct list_data list_data, *ld;
 	ulong *wq_list;			/* addr of wait queue element */
 	ulong next_offset;		/* next pointer of wq element */
-	ulong task_offset;		/* offset of task in wq element */
+	ulong task_offset = 0;		/* offset of task in wq element */
 	int cnt;			/* # elems on Queue */
-	int start_index;		/* where to start in wq array */
+	int start_index = -1;		/* where to start in wq array */
 	int i;
 
 	ld = &list_data;
@@ -9255,8 +9461,19 @@ dump_waitq(ulong wq, char *wq_name)
                 ld->member_offset = next_offset;
 
 		start_index = 1;
+	} else if (VALID_STRUCT(wait_queue_entry)) {
+		ulong head_offset;
+
+		next_offset = OFFSET(list_head_next);
+		task_offset = OFFSET(wait_queue_entry_private);
+		head_offset = OFFSET(wait_queue_head_head);
+		ld->end = ld->start = wq + head_offset + next_offset;
+		ld->list_head_offset = OFFSET(wait_queue_entry_entry);
+		ld->member_offset = next_offset;
+
+		start_index = 1;
 	} else {
-		return;
+		error(FATAL, "cannot determine wait queue structures\n");
 	}
 
 	hq_open();
@@ -10105,7 +10322,7 @@ static struct ikconfig_list {
 	char *val;
 } *ikconfig_all;
 
-static void add_ikconfig_entry(char *line, struct ikconfig_list *ent)
+static int add_ikconfig_entry(char *line, struct ikconfig_list *ent)
 {
 	char *tokptr, *name, *val;
 
@@ -10113,8 +10330,16 @@ static void add_ikconfig_entry(char *line, struct ikconfig_list *ent)
 	sscanf(name, "CONFIG_%s", name);
 	val = strtok_r(NULL, "", &tokptr);
 
+	if (!val) {
+		if (CRASHDEBUG(2))
+			error(WARNING, "invalid ikconfig entry: %s\n", line);
+		return FALSE;
+	}
+
 	ent->name = strdup(name);
 	ent->val = strdup(val);
+
+	return TRUE;
 }
 
 static int setup_ikconfig(char *config)
@@ -10133,9 +10358,9 @@ static int setup_ikconfig(char *config)
 		while (whitespace(*ent))
 			ent++;
 
-		if (ent[0] != '#') {
-			add_ikconfig_entry(ent,
-					 &ikconfig_all[kt->ikconfig_ents++]);
+		if (STRNEQ(ent, "CONFIG_")) {
+			if (add_ikconfig_entry(ent, &ikconfig_all[kt->ikconfig_ents]))
+				kt->ikconfig_ents++;
 			if (kt->ikconfig_ents == IKCONFIG_MAX) {
 				error(WARNING, "ikconfig overflow.\n");
 				return 1;
@@ -10537,6 +10762,42 @@ paravirt_init(void)
 			error(INFO, "pv_ops exists: ARCH_PVOPS\n");
 		kt->flags |= ARCH_PVOPS;
 	}
+}
+
+static int
+is_pvops_xen(void)
+{
+	ulong addr;
+	char *sym;
+
+	if (!PVOPS())
+		return FALSE;
+
+	if (symbol_exists("pv_init_ops") &&
+	    readmem(symbol_value("pv_init_ops"), KVADDR, &addr,
+	    sizeof(void *), "pv_init_ops", RETURN_ON_ERROR) &&
+	    (sym = value_symbol(addr)) &&
+	    (STREQ(sym, "xen_patch") ||
+	     STREQ(sym, "paravirt_patch_default")))
+		return TRUE;
+
+	if (machine_type("X86") || machine_type("X86_64")) {
+		if (symbol_exists("xen_start_info") &&
+		    readmem(symbol_value("xen_start_info"), KVADDR, &addr,
+		    sizeof(void *), "xen_start_info", RETURN_ON_ERROR) &&
+		    addr != 0)
+			return TRUE;
+	}
+
+	if (machine_type("ARM") || machine_type("ARM64")) {
+		if (symbol_exists("xen_vcpu_info") &&
+		    readmem(symbol_value("xen_vcpu_info"), KVADDR, &addr,
+		    sizeof(void *), "xen_vcpu_info", RETURN_ON_ERROR) &&
+		    addr != 0)
+			return TRUE;
+	}
+
+	return FALSE;
 }
 
 /*
@@ -11007,134 +11268,101 @@ dump_variable_length_record(void)
 }
 
 static void
-show_kernel_taints_v4_10(char *buf, int verbose)
-{
-	int i, bx;
-	char tnt_true, tnt_false;
-	int tnts_len;
-	ulong tnts_addr;
-	ulong tainted_mask, *tainted_mask_ptr;
-	struct syment *sp;
-
-	if (!VALID_STRUCT(taint_flag)) {
-		STRUCT_SIZE_INIT(taint_flag, "taint_flag");
-		MEMBER_OFFSET_INIT(tnt_true, "taint_flag", "true");
-		MEMBER_OFFSET_INIT(tnt_false, "taint_flag", "false");
-		if (INVALID_MEMBER(tnt_true)) {
-			MEMBER_OFFSET_INIT(tnt_true, "taint_flag", "c_true");
-			MEMBER_OFFSET_INIT(tnt_false, "taint_flag", "c_false");
-		}
-	}
-
-	bx = 0;
-	buf[0] = '\0';
-
-	/*
-	 *  Make sure that all dependencies are valid to prevent
-	 *  a fatal error from killing the session during the 
-	 *  pre-RUNTIME system banner display.
-	 */ 
-	if (!(pc->flags & RUNTIME)) {
-		if (INVALID_MEMBER(tnt_true) || INVALID_MEMBER(tnt_false) ||
-		    !kernel_symbol_exists("tainted_mask"))
-			return;
-	}
-
-	tnts_len = get_array_length("taint_flags", NULL, 0);
-	sp = symbol_search("taint_flags");
-	tnts_addr = sp->value;
-
-	get_symbol_data("tainted_mask", sizeof(ulong), &tainted_mask);
-	tainted_mask_ptr = &tainted_mask;
-
-	for (i = 0; i < tnts_len; i++) {
-		if (NUM_IN_BITMAP(tainted_mask_ptr, i)) {
-			readmem((tnts_addr + i * SIZE(taint_flag)) +
-					OFFSET(tnt_true),
-				KVADDR, &tnt_true, sizeof(char),
-				"tnt true", FAULT_ON_ERROR);
-				buf[bx++] = tnt_true;
-		} else {
-			readmem((tnts_addr + i * SIZE(taint_flag)) +
-					OFFSET(tnt_false),
-				KVADDR, &tnt_false, sizeof(char),
-				"tnt false", FAULT_ON_ERROR);
-			if (tnt_false != ' ' && tnt_false != '-' &&
-			    tnt_false != 'G')
-				buf[bx++] = tnt_false;
-		}
-	}
-
-	buf[bx++] = '\0';
-
-	if (verbose)
-		fprintf(fp, "TAINTED_MASK: %lx  %s\n", tainted_mask, buf);
-}
-
-static void
 show_kernel_taints(char *buf, int verbose)
 {
 	int i, bx;
 	uint8_t tnt_bit;
 	char tnt_true, tnt_false;
-	int tnts_len;
+	int tnts_len = 0;
 	ulong tnts_addr;
 	ulong tainted_mask, *tainted_mask_ptr;
 	int tainted;
-	struct syment *sp;
+	struct syment *sp = NULL;
 
-	if (VALID_STRUCT(taint_flag) ||
-	    (kernel_symbol_exists("taint_flags") && STRUCT_EXISTS("taint_flag"))) {
-		show_kernel_taints_v4_10(buf, verbose);
-		return;
-	}
-
-	if (!VALID_STRUCT(tnt)) { 
-                STRUCT_SIZE_INIT(tnt, "tnt");
-                MEMBER_OFFSET_INIT(tnt_bit, "tnt", "bit");
-                MEMBER_OFFSET_INIT(tnt_true, "tnt", "true");
-                MEMBER_OFFSET_INIT(tnt_false, "tnt", "false");
-        }
-
-	if (VALID_STRUCT(tnt) && (sp = symbol_search("tnts"))) {
-		tnts_len = get_array_length("tnts", NULL, 0);
-		tnts_addr = sp->value;
-	} else
-		tnts_addr = tnts_len = 0;
-
-	bx = 0;
-	buf[0] = '\0';
-
-	tainted_mask = tainted = 0;
-
-	if (kernel_symbol_exists("tainted_mask")) {
-		get_symbol_data("tainted_mask", sizeof(ulong), &tainted_mask);
-		tainted_mask_ptr = &tainted_mask;
-	} else if (kernel_symbol_exists("tainted")) {
+	if (kernel_symbol_exists("tainted")) {
 		get_symbol_data("tainted", sizeof(int), &tainted);
 		if (verbose)
 			fprintf(fp, "TAINTED: %x\n", tainted);
 		return;
+	} else if (VALID_STRUCT(tnt) ||
+	    (kernel_symbol_exists("tnts") && STRUCT_EXISTS("tnt"))) {
+		if (!VALID_STRUCT(tnt)) {
+			STRUCT_SIZE_INIT(tnt, "tnt");
+			MEMBER_OFFSET_INIT(tnt_bit, "tnt", "bit");
+			MEMBER_OFFSET_INIT(tnt_true, "tnt", "true");
+			MEMBER_OFFSET_INIT(tnt_false, "tnt", "false");
+		}
+
+		tnts_len = get_array_length("tnts", NULL, 0);
+		sp = symbol_search("tnts");
+	} else if (VALID_STRUCT(taint_flag) ||
+	    (kernel_symbol_exists("taint_flags") && STRUCT_EXISTS("taint_flag"))) {
+		if (!(VALID_STRUCT(taint_flag) &&
+					VALID_MEMBER(tnt_true) && VALID_MEMBER(tnt_false))) {
+			STRUCT_SIZE_INIT(taint_flag, "taint_flag");
+			MEMBER_OFFSET_INIT(tnt_true, "taint_flag", "true");
+			MEMBER_OFFSET_INIT(tnt_false, "taint_flag", "false");
+			if (INVALID_MEMBER(tnt_true)) {
+				MEMBER_OFFSET_INIT(tnt_true, "taint_flag", "c_true");
+				MEMBER_OFFSET_INIT(tnt_false, "taint_flag", "c_false");
+			}
+		}
+
+		if (!(pc->flags & RUNTIME)) {
+			if (INVALID_MEMBER(tnt_true) || INVALID_MEMBER(tnt_false) ||
+					!kernel_symbol_exists("tainted_mask"))
+				return;
+		}
+
+		tnts_len = get_array_length("taint_flags", NULL, 0);
+		sp = symbol_search("taint_flags");
 	} else if (verbose)
 		option_not_supported('t');
 
-	for (i = 0; i < (tnts_len * SIZE(tnt)); i += SIZE(tnt)) {
-		readmem((tnts_addr + i) + OFFSET(tnt_bit),
-			KVADDR, &tnt_bit, sizeof(uint8_t), 
-			"tnt bit", FAULT_ON_ERROR);
+	tnts_addr = sp->value;
+	get_symbol_data("tainted_mask", sizeof(ulong), &tainted_mask);
+	tainted_mask_ptr = &tainted_mask;
 
-		if (NUM_IN_BITMAP(tainted_mask_ptr, tnt_bit)) {
-			readmem((tnts_addr + i) + OFFSET(tnt_true),
-				KVADDR, &tnt_true, sizeof(char), 
-				"tnt true", FAULT_ON_ERROR);
+	bx = 0;
+	buf[0] = '\0';
+
+	if (VALID_STRUCT(tnt)) {
+		for (i = 0; i < (tnts_len * SIZE(tnt)); i += SIZE(tnt)) {
+			readmem((tnts_addr + i) + OFFSET(tnt_bit),
+				KVADDR, &tnt_bit, sizeof(uint8_t),
+				"tnt bit", FAULT_ON_ERROR);
+
+			if (NUM_IN_BITMAP(tainted_mask_ptr, tnt_bit)) {
+				readmem((tnts_addr + i) + OFFSET(tnt_true),
+					KVADDR, &tnt_true, sizeof(char),
+					"tnt true", FAULT_ON_ERROR);
+					buf[bx++] = tnt_true;
+			} else {
+				readmem((tnts_addr + i) + OFFSET(tnt_false),
+					KVADDR, &tnt_false, sizeof(char),
+					"tnt false", FAULT_ON_ERROR);
+				if (tnt_false != ' ' && tnt_false != '-' &&
+				    tnt_false != 'G')
+					buf[bx++] = tnt_false;
+			}
+		}
+	} else if (VALID_STRUCT(taint_flag)) {
+		for (i = 0; i < tnts_len; i++) {
+			if (NUM_IN_BITMAP(tainted_mask_ptr, i)) {
+				readmem((tnts_addr + i * SIZE(taint_flag)) +
+						OFFSET(tnt_true),
+						KVADDR, &tnt_true, sizeof(char),
+						"tnt true", FAULT_ON_ERROR);
 				buf[bx++] = tnt_true;
-		} else {
-			readmem((tnts_addr + i) + OFFSET(tnt_false),
-				KVADDR, &tnt_false, sizeof(char), 
-				"tnt false", FAULT_ON_ERROR);
-			if (tnt_false != ' ' && tnt_false != '-' &&
-			    tnt_false != 'G')
-				buf[bx++] = tnt_false;
+			} else {
+				readmem((tnts_addr + i * SIZE(taint_flag)) +
+						OFFSET(tnt_false),
+						KVADDR, &tnt_false, sizeof(char),
+						"tnt false", FAULT_ON_ERROR);
+				if (tnt_false != ' ' && tnt_false != '-' &&
+						tnt_false != 'G')
+					buf[bx++] = tnt_false;
+			}
 		}
 	}
 
@@ -11253,7 +11481,8 @@ dump_audit_skb_queue(ulong audit_skb_queue)
 
 	p = skb_buff_head_next;
 	do {
-		ulong data, len, data_len;
+		ulong data, data_len;
+		uint len;
 		uint16_t nlmsg_type;
 		char *buf = NULL;
 
@@ -11264,7 +11493,7 @@ dump_audit_skb_queue(ulong audit_skb_queue)
 			KVADDR,
 			&len,
 			SIZE(sk_buff_len),
-			"sk_buff.data",
+			"sk_buff.len",
 			FAULT_ON_ERROR);
 
 		data_len = len - roundup(SIZE(nlmsghdr), NLMSG_ALIGNTO);
@@ -11337,6 +11566,153 @@ dump_audit(void)
 
 	if (!qlen)
 		error(INFO, "kernel audit log is empty\n");
+}
+
+#define PRINTK_SAFE_SEQ_BUF_INDENT 2
+
+static void
+__dump_printk_safe_seq_buf(char *buf_name, int msg_flags)
+{
+	int cpu, buffer_size;
+	char *buffer;
+	ulong base_addr, len_addr, message_lost_addr, buffer_addr;
+	bool show_header;
+
+	show_header = msg_flags & SHOW_LOG_SAFE;
+
+	if (!symbol_exists(buf_name)) {
+		return;
+	}
+
+	base_addr = symbol_value(buf_name);
+	len_addr = base_addr + OFFSET(printk_safe_seq_buf_len)
+			+ OFFSET(atomic_t_counter);
+	message_lost_addr = base_addr
+			+ OFFSET(printk_safe_seq_buf_message_lost)
+			+ OFFSET(atomic_t_counter);
+	buffer_addr = base_addr + OFFSET(printk_safe_seq_buf_buffer);
+	buffer_size = SIZE(printk_safe_seq_buf_buffer);
+	buffer = GETBUF(buffer_size);
+
+	if (show_header)
+		fprintf(fp, "PRINTK_SAFE_SEQ_BUF: %s\n", buf_name);
+	for (cpu = 0; cpu < kt->cpus; cpu++) {
+		int len, message_lost;
+		ulong per_cpu_offset;
+		per_cpu_offset = kt->__per_cpu_offset[cpu];
+
+		readmem(len_addr + per_cpu_offset, KVADDR, &len, sizeof(int),
+			"printk_safe_seq_buf len", FAULT_ON_ERROR);
+
+		if (show_header) {
+			readmem(message_lost_addr + per_cpu_offset, KVADDR,
+				&message_lost, sizeof(int),
+				"printk_safe_seq_buf message_lost", FAULT_ON_ERROR);
+			fprintf(fp, "CPU: %d  ADDR: %lx LEN: %d  MESSAGE_LOST: %d\n",
+				cpu, base_addr + per_cpu_offset, len, message_lost);
+		}
+
+		if (len > 0) {
+			int i, n, ilen;
+			char *p;
+			bool start_of_line;
+
+			ilen = 0;
+			if (show_header) {
+				ilen = PRINTK_SAFE_SEQ_BUF_INDENT;
+			} else {
+				if (msg_flags & SHOW_LOG_TEXT)
+					ilen = 0;
+				else
+					ilen = strlen(buf_name) + 3; // "[%s] "
+			}
+			if (msg_flags & SHOW_LOG_LEVEL)
+				ilen += 3; // "<%c>"
+
+			readmem(buffer_addr + per_cpu_offset, KVADDR,
+				buffer, buffer_size,
+				"printk_safe_seq_buf buffer", FAULT_ON_ERROR);
+
+			start_of_line = true;
+			n = (len <= buffer_size) ? len : buffer_size;
+			for (i = 0, p = buffer; i < n; i++, p++) {
+				bool sol = start_of_line;
+				start_of_line = false;
+				if (*p == 0x1) { //SOH
+					i++; p++;
+
+					if (!sol)
+						fprintf(fp, "\n");
+
+					if (show_header)
+						fprintf(fp, "%s", space(PRINTK_SAFE_SEQ_BUF_INDENT));
+					else if (!(msg_flags & SHOW_LOG_TEXT))
+						fprintf(fp, "[%s] ", buf_name);
+
+					if ((msg_flags & SHOW_LOG_LEVEL) && (i < n)) {
+						switch (*p) {
+						case '0' ... '7':
+						case 'c':
+							fprintf(fp, "<%c>", *p);
+						}
+					}
+
+					continue;
+				} else {
+					if (sol)
+						fprintf(fp, "%s", space(ilen));
+
+					if (isprint(*p) || isspace(*p)) {
+						fputc(*p, fp);
+						if (*p == '\n')
+							start_of_line = true;
+					} else {
+						fputc('.', fp);
+					}
+				}
+			}
+			if (!start_of_line)
+				fputc('\n', fp);
+			if (show_header)
+				fputc('\n', fp);
+		} else if (show_header) {
+			fprintf(fp, "%s(empty)\n\n", space(PRINTK_SAFE_SEQ_BUF_INDENT));
+		}
+	}
+	FREEBUF(buffer);
+}
+
+static void
+dump_printk_safe_seq_buf(int msg_flags)
+{
+	if (!STRUCT_EXISTS("printk_safe_seq_buf"))
+		return;
+
+	if (INVALID_SIZE(printk_safe_seq_buf_buffer)) {
+		MEMBER_OFFSET_INIT(printk_safe_seq_buf_len,
+			"printk_safe_seq_buf", "len");
+		MEMBER_OFFSET_INIT(printk_safe_seq_buf_message_lost,
+			"printk_safe_seq_buf", "message_lost");
+		MEMBER_OFFSET_INIT(printk_safe_seq_buf_buffer,
+			"printk_safe_seq_buf", "buffer");
+
+		if (!INVALID_MEMBER(printk_safe_seq_buf_buffer)) {
+			MEMBER_SIZE_INIT(printk_safe_seq_buf_buffer,
+				"printk_safe_seq_buf", "buffer");
+		}
+	}
+
+	if (INVALID_MEMBER(printk_safe_seq_buf_len) ||
+	    INVALID_MEMBER(printk_safe_seq_buf_message_lost) ||
+	    INVALID_MEMBER(printk_safe_seq_buf_buffer) ||
+	    INVALID_SIZE(printk_safe_seq_buf_buffer)) {
+		if (msg_flags & SHOW_LOG_SAFE)
+			error(INFO, "-s not supported with this kernel version\n");
+		return;
+	}
+
+	__dump_printk_safe_seq_buf("nmi_print_seq", msg_flags);
+	__dump_printk_safe_seq_buf("safe_print_seq", msg_flags);
 }
 
 /*
@@ -11418,4 +11794,35 @@ check_vmcoreinfo(void)
 			break;
 		}
 	}
+}
+
+static
+int get_linux_banner_from_vmlinux(char *buf, size_t size)
+{
+	struct bfd_section *sect;
+	long offset;
+
+	if (!kernel_symbol_exists(".rodata"))
+		return FALSE;
+
+	sect = bfd_get_section_by_name(st->bfd, ".rodata");
+	if (!sect)
+		return FALSE;
+
+	/*
+	 * Although symbol_value() returns dynamic symbol value that
+	 * is affected by kaslr, which is different from static symbol
+	 * value in vmlinux file, but relative offset to linux_banner
+	 * object in .rodata section is idential.
+	 */
+	offset = symbol_value("linux_banner") - symbol_value(".rodata");
+
+	if (!bfd_get_section_contents(st->bfd,
+				      sect,
+				      buf,
+				      offset,
+				      size))
+		return FALSE;
+
+	return TRUE;
 }

@@ -32,13 +32,13 @@
   A whitepaper with complete documentation concerning the use of this utility
   can be found here:
  
-         http://people.redhat.com/anderson/crash_whitepaper
+         https://crash-utility.github.io/crash_whitepaper.html
  
   These are the current prerequisites: 
 
   o  At this point, x86, ia64, x86_64, ppc64, ppc, arm, arm64, alpha, mips,
-     s390 and s390x-based kernels are supported.  Other architectures may be
-     addressed in the future.
+     mips64, s390 and s390x-based kernels are supported.  Other architectures
+     may be addressed in the future.
 
   o  One size fits all -- the utility can be run on any Linux kernel version
      version dating back to 2.2.5-15.  A primary design goal is to always
@@ -74,8 +74,8 @@
 
   To build the crash utility: 
 
-    $ tar -xf crash-7.2.6.tar.gz
-    $ cd crash-7.2.6
+    $ tar -xf crash-8.0.1.tar.gz
+    $ cd crash-8.0.1
     $ make
 
   The initial build will take several minutes  because the embedded gdb module
@@ -102,8 +102,12 @@
   Traditionally when vmcores are compressed via the makedumpfile(8) facility
   the libz compression library is used, and by default the crash utility
   only supports libz.  Recently makedumpfile has been enhanced to optionally
-  use either the LZO or snappy compression libraries.  To build crash with
-  either or both of those libraries, type "make lzo" or "make snappy".
+  use the LZO, snappy or zstd compression libraries.  To build crash with any
+  or all of those libraries, type "make lzo", "make snappy" or "make zstd".
+
+  crash supports valgrind Memcheck tool on the crash's custom memory allocator.
+  To build crash with this feature enabled, type "make valgrind" and then run
+  crash with valgrind as "valgrind crash vmlinux vmcore".
 
   All of the alternate build commands above are "sticky" in that the
   special "make" targets only have to be entered one time; all subsequent
@@ -118,7 +122,7 @@
   If neither /dev/mem or /dev/crash are available, then /proc/kcore will be
   be used as the live memory source.  If /proc/kcore is also restricted, then
   the Red Hat /dev/crash driver may be compiled and installed; its source
-  is included in the crash-7.2.6/memory_driver subdirectory.
+  is included in the crash-8.0.1/memory_driver subdirectory.
 
   If the kernel file is stored in /boot, /, /boot/efi, or in any /usr/src
   or /usr/lib/debug/lib/modules subdirectory, then no command line arguments
@@ -129,21 +133,22 @@
 
     $ crash
     
-    crash 7.2.6
-    Copyright (C) 2002-2019  Red Hat, Inc.
+    crash 8.0.1
+    Copyright (C) 2002-2022  Red Hat, Inc.
     Copyright (C) 2004, 2005, 2006, 2010  IBM Corporation
     Copyright (C) 1999-2006  Hewlett-Packard Co
     Copyright (C) 2005, 2006, 2011, 2012  Fujitsu Limited
     Copyright (C) 2006, 2007  VA Linux Systems Japan K.K.
-    Copyright (C) 2005, 2011  NEC Corporation
+    Copyright (C) 2005, 2011, 2020-2022  NEC Corporation
     Copyright (C) 1999, 2002, 2007  Silicon Graphics, Inc.
     Copyright (C) 1999, 2000, 2001, 2002  Mission Critical Linux, Inc.
+    Copyright (C) 2015, 2021  VMware, Inc.
     This program is free software, covered by the GNU General Public License,
     and you are welcome to change it and/or distribute copies of it under
     certain conditions.  Enter "help copying" to see the conditions.
     This program has absolutely no warranty.  Enter "help warranty" for details.
      
-    GNU gdb 7.6
+    GNU gdb 10.2
     Copyright 2013 Free Software Foundation, Inc.
     License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
     This is free software: you are free to change and redistribute it.
@@ -154,7 +159,7 @@
           KERNEL: /boot/vmlinux
         DUMPFILE: /dev/mem
             CPUS: 1
-            DATE: Fri May  3 13:57:10 2019
+            DATE: Mon Apr 25 15:42:36 JST 2022
           UPTIME: 10 days, 22:55:18
     LOAD AVERAGE: 0.08, 0.03, 0.01
            TASKS: 42
@@ -171,18 +176,19 @@
 
     crash> help
 
-    *              extend         log            rd             task           
-    alias          files          mach           repeat         timer          
-    ascii          foreach        mod            runq           tree           
-    bpf            fuser          mount          search         union          
-    bt             gdb            net            set            vm             
-    btop           help           p              sig            vtop           
-    dev            ipcs           ps             struct         waitq          
-    dis            irq            pte            swap           whatis         
-    eval           kmem           ptob           sym            wr             
-    exit           list           ptov           sys            q              
+    *              files          mod            sbitmapq       union          
+    alias          foreach        mount          search         vm             
+    ascii          fuser          net            set            vtop           
+    bpf            gdb            p              sig            waitq          
+    bt             help           ps             struct         whatis         
+    btop           ipcs           pte            swap           wr             
+    dev            irq            ptob           sym            q              
+    dis            kmem           ptov           sys            
+    eval           list           rd             task           
+    exit           log            repeat         timer          
+    extend         mach           runq           tree           
     
-    crash version: 7.2.6    gdb version: 7.6
+    crash version: 8.0.1    gdb version: 10.2
     For help on any command above, enter "help <command>".
     For help on input options, enter "help input".
     For help on output options, enter "help output".
@@ -195,21 +201,22 @@
 
     $ crash vmlinux vmcore
  
-    crash 7.2.6
-    Copyright (C) 2002-2019  Red Hat, Inc.
+    crash 8.0.1
+    Copyright (C) 2002-2022  Red Hat, Inc.
     Copyright (C) 2004, 2005, 2006, 2010  IBM Corporation
     Copyright (C) 1999-2006  Hewlett-Packard Co
     Copyright (C) 2005, 2006, 2011, 2012  Fujitsu Limited
     Copyright (C) 2006, 2007  VA Linux Systems Japan K.K.
-    Copyright (C) 2005, 2011  NEC Corporation
+    Copyright (C) 2005, 2011, 2020-2022  NEC Corporation
     Copyright (C) 1999, 2002, 2007  Silicon Graphics, Inc.
     Copyright (C) 1999, 2000, 2001, 2002  Mission Critical Linux, Inc.
+    Copyright (C) 2015, 2021  VMware, Inc.
     This program is free software, covered by the GNU General Public License,
     and you are welcome to change it and/or distribute copies of it under
     certain conditions.  Enter "help copying" to see the conditions.
     This program has absolutely no warranty.  Enter "help warranty" for details.
      
-    GNU gdb 7.6
+    GNU gdb 10.2
     Copyright 2013 Free Software Foundation, Inc.
     License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
     This is free software: you are free to change and redistribute it.

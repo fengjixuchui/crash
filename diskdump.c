@@ -74,6 +74,7 @@ struct diskdump_data {
 	ulong	evictions;		/* total evictions done */
 	ulong	cached_reads;
 	ulong  *valid_pages;
+	int     max_sect_len;           /* highest bucket of valid_pages */
 	ulong   accesses;
 	ulong	snapshot_task;
 };
@@ -110,8 +111,7 @@ map_cpus_to_prstatus_kdump_cmprs(void)
 	if (pc->flags2 & QEMU_MEM_DUMP_COMPRESSED)  /* notes exist for all cpus */
 		goto resize_note_pointers;
 
-	if (!(online = get_cpus_online()) || (online == kt->cpus) || 
-	    machine_type("ARM64"))
+	if (!(online = get_cpus_online()) || (online == kt->cpus))
 		goto resize_note_pointers;
 
 	if (CRASHDEBUG(1))
@@ -233,7 +233,7 @@ clean_diskdump_data(void)
 }
 
 static inline int 
-get_bit(char *map, int byte, int bit)
+get_bit(char *map, unsigned long byte, int bit)
 {
 	return map[byte] & (1<<bit);
 }
@@ -509,6 +509,27 @@ arm_kdump_header_adjust(int header_version)
 }
 #endif  /* __i386__ && (ARM || MIPS) */
 
+/*
+ * Read page descriptor.
+ */
+static int
+read_pd(int fd, off_t offset, page_desc_t *pd)
+{
+	const off_t failed = (off_t)-1;
+
+	if (FLAT_FORMAT()) {
+		if (!read_flattened_format(fd, offset, pd, sizeof(*pd)))
+			return READ_ERROR;
+	} else {
+		if (lseek(fd, offset, SEEK_SET) == failed)
+			return SEEK_ERROR;
+		if (read(fd, pd, sizeof(*pd)) != sizeof(*pd))
+			return READ_ERROR;
+	}
+
+	return 0;
+}
+
 static int 
 read_dump_header(char *file)
 {
@@ -517,15 +538,13 @@ read_dump_header(char *file)
 	struct kdump_sub_header *sub_header_kdump = NULL;
 	size_t size;
 	off_t bitmap_len;
-	char *bufptr;
-	size_t len;
-	ssize_t bytes_read;
 	int block_size = (int)sysconf(_SC_PAGESIZE);
 	off_t offset;
 	const off_t failed = (off_t)-1;
 	ulong pfn;
 	int i, j, max_sect_len;
 	int is_split = 0;
+	ulonglong tmp, *bitmap;
 
 	if (block_size < 0)
 		return FALSE;
@@ -591,8 +610,11 @@ restart:
 	else if (STRNEQ(header->utsname.machine, "arm") &&
 	    machine_type_mismatch(file, "ARM", NULL, 0))
 		goto err;
-	else if (STRNEQ(header->utsname.machine, "mips") &&
+	else if (STREQ(header->utsname.machine, "mips") &&
 	    machine_type_mismatch(file, "MIPS", NULL, 0))
+		goto err;
+	else if (STRNEQ(header->utsname.machine, "mips64") &&
+	    machine_type_mismatch(file, "MIPS64", NULL, 0))
 		goto err;
 	else if (STRNEQ(header->utsname.machine, "s390x") &&
 	    machine_type_mismatch(file, "S390X", NULL, 0))
@@ -694,14 +716,10 @@ restart:
 		dd->max_mapnr = header->max_mapnr;
 
 	/* read memory bitmap */
-	bitmap_len = block_size * header->bitmap_blocks;
+	bitmap_len = (off_t)block_size * header->bitmap_blocks;
 	dd->bitmap_len = bitmap_len;
 
 	offset = (off_t)block_size * (1 + header->sub_hdr_size);
-
-	if ((dd->bitmap = malloc(bitmap_len)) == NULL)
-		error(FATAL, "%s: cannot malloc bitmap buffer\n",
-			DISKDUMP_VALID() ? "diskdump" : "compressed kdump");
 
 	dd->dumpable_bitmap = calloc(bitmap_len, 1);
 
@@ -711,30 +729,23 @@ restart:
 			(ulonglong)offset);
 
 	if (FLAT_FORMAT()) {
+		if ((dd->bitmap = malloc(bitmap_len)) == NULL)
+			error(FATAL, "%s: cannot malloc bitmap buffer\n",
+				DISKDUMP_VALID() ? "diskdump" : "compressed kdump");
+
 		if (!read_flattened_format(dd->dfd, offset, dd->bitmap, bitmap_len)) {
 			error(INFO, "%s: cannot read memory bitmap\n",
 				DISKDUMP_VALID() ? "diskdump" : "compressed kdump");
 			goto err;
 		}
 	} else {
-		if (lseek(dd->dfd, offset, SEEK_SET) == failed) {
-			error(INFO, "%s: cannot lseek memory bitmap\n",
+		dd->bitmap = mmap(NULL, bitmap_len, PROT_READ,
+					MAP_SHARED, dd->dfd, offset);
+		if (dd->bitmap == MAP_FAILED)
+			error(FATAL, "%s: cannot mmap bitmap buffer\n",
 				DISKDUMP_VALID() ? "diskdump" : "compressed kdump");
-			goto err;
-		}
-		bufptr = dd->bitmap;
-		len = bitmap_len;
-		while (len) {
-			bytes_read = read(dd->dfd, bufptr, len);
-			if (bytes_read <= 0) {
-				error(INFO, "%s: cannot read memory bitmap\n",
-					DISKDUMP_VALID() ? "diskdump"
-					: "compressed kdump");
-				goto err;
-			}
-			len -= bytes_read;
-			bufptr += bytes_read;
-		}
+
+		madvise(dd->bitmap, bitmap_len, MADV_WILLNEED);
 	}
 
 	if (dump_is_partial(header))
@@ -744,14 +755,14 @@ restart:
 		memcpy(dd->dumpable_bitmap, dd->bitmap, bitmap_len);
 
 	dd->data_offset
-		= (1 + header->sub_hdr_size + header->bitmap_blocks)
+		= (1UL + header->sub_hdr_size + header->bitmap_blocks)
 		* header->block_size;
 
 	dd->header = header;
 
 	if (machine_type("ARM"))
 		dd->machine_type = EM_ARM;
-	else if (machine_type("MIPS"))
+	else if (machine_type("MIPS") || machine_type("MIPS64"))
 		dd->machine_type = EM_MIPS;
 	else if (machine_type("X86"))
 		dd->machine_type = EM_386;
@@ -874,11 +885,17 @@ restart:
 	}
 
 	dd->valid_pages = calloc(sizeof(ulong), max_sect_len + 1);
+	dd->max_sect_len = max_sect_len;
+
+	/* It is safe to convert it to (ulonglong *). */
+	bitmap = (ulonglong *)dd->dumpable_bitmap;
 	for (i = 1; i < max_sect_len + 1; i++) {
 		dd->valid_pages[i] = dd->valid_pages[i - 1];
-		for (j = 0; j < BITMAP_SECT_LEN; j++, pfn++)
-			if (page_is_dumpable(pfn))
-				dd->valid_pages[i]++;
+		for (j = 0; j < BITMAP_SECT_LEN; j += 64, pfn += 64) {
+			tmp = bitmap[pfn >> 6];
+			if (tmp)
+				dd->valid_pages[i] += hweight64(tmp);
+		}
 	}
 
         return TRUE;
@@ -889,8 +906,12 @@ err:
 		free(sub_header);
 	if (sub_header_kdump)
 		free(sub_header_kdump);
-	if (dd->bitmap)
-		free(dd->bitmap);
+	if (dd->bitmap) {
+		if (FLAT_FORMAT())
+			free(dd->bitmap);
+		else
+			munmap(dd->bitmap, dd->bitmap_len);
+	}
 	if (dd->dumpable_bitmap)
 		free(dd->dumpable_bitmap);
 	if (dd->notes_buf)
@@ -974,6 +995,9 @@ is_diskdump(char *file)
 
 #ifdef SNAPPY
 	dd->flags |= SNAPPY_SUPPORTED;
+#endif
+#ifdef ZSTD
+	dd->flags |= ZSTD_SUPPORTED;
 #endif
 
 	pc->read_vmcoreinfo = vmcoreinfo_read_string;
@@ -1098,6 +1122,9 @@ cache_page(physaddr_t paddr)
 	const int block_size = dd->block_size;
 	const off_t failed = (off_t)-1;
 	ulong retlen;
+#ifdef ZSTD
+	static ZSTD_DCtx *dctx = NULL;
+#endif
 
 	for (i = found = 0; i < DISKDUMP_CACHED_PAGES; i++) {
 		if (DISKDUMP_VALID_PAGE(dd->page_cache_hdr[i].pg_flags))
@@ -1125,15 +1152,9 @@ cache_page(physaddr_t paddr)
 			+ (off_t)(desc_pos - 1)*sizeof(page_desc_t);
 
 	/* read page descriptor */
-	if (FLAT_FORMAT()) {
-		if (!read_flattened_format(dd->dfd, seek_offset, &pd, sizeof(pd)))
-			return READ_ERROR;
-	} else {
-		if (lseek(dd->dfd, seek_offset, SEEK_SET) == failed)
-			return SEEK_ERROR;
-		if (read(dd->dfd, &pd, sizeof(pd)) != sizeof(pd))
-			return READ_ERROR;
-	}
+	ret = read_pd(dd->dfd, seek_offset, &pd);
+	if (ret)
+		return ret;
 
 	/* sanity check */
 	if (pd.size > block_size)
@@ -1143,10 +1164,9 @@ cache_page(physaddr_t paddr)
 	if (FLAT_FORMAT()) {
 		if (!read_flattened_format(dd->dfd, pd.offset, dd->compressed_page, pd.size))
 			return READ_ERROR;
-	} else if (is_incomplete_dump() && (0 == pd.offset)) {
+	} else if (0 == pd.offset) {
 		/*
-		 *  If the incomplete flag has been set in the header, 
-		 *  first check whether zero_excluded has been set.
+		 *  First check whether zero_excluded has been set.
 		 */
 		if (*diskdump_flags & ZERO_EXCLUDED) {
 			if (CRASHDEBUG(8))
@@ -1155,8 +1175,15 @@ cache_page(physaddr_t paddr)
 				    "paddr/pfn: %llx/%lx\n", 
 					(ulonglong)paddr, pfn);
 			memset(dd->compressed_page, 0, dd->block_size);
-		} else
-			return READ_ERROR;
+		} else {
+			if (CRASHDEBUG(8))
+				fprintf(fp,
+					"read_diskdump/cache_page: "
+					"descriptor with zero offset found at "
+					"paddr/pfn/pos: %llx/%lx/%lx\n",
+					(ulonglong)paddr, pfn, desc_pos);
+			return PAGE_INCOMPLETE;
+		}
 	} else {
 		if (lseek(dd->dfd, pd.offset, SEEK_SET) == failed)
 			return SEEK_ERROR;
@@ -1223,6 +1250,33 @@ cache_page(physaddr_t paddr)
 			error(INFO, "%s: uncompress failed: %d\n", 
 			      DISKDUMP_VALID() ? "diskdump" : "compressed kdump",
 			      ret);
+			return READ_ERROR;
+		}
+#endif
+	} else if (pd.flags & DUMP_DH_COMPRESSED_ZSTD) {
+
+		if (!(dd->flags & ZSTD_SUPPORTED)) {
+			error(INFO, "%s: uncompess failed: no zstd compression support\n",
+				DISKDUMP_VALID() ? "diskdump" : "compressed kdump");
+			return READ_ERROR;
+		}
+#ifdef ZSTD
+		if (!dctx) {
+			dctx = ZSTD_createDCtx();
+			if (!dctx) {
+				error(INFO, "%s: uncompess failed: cannot create ZSTD_DCtx\n",
+					DISKDUMP_VALID() ? "diskdump" : "compressed kdump");
+				return READ_ERROR;
+			}
+		}
+
+		retlen = ZSTD_decompressDCtx(dctx,
+				dd->page_cache_hdr[i].pg_bufptr, block_size,
+				dd->compressed_page, pd.size);
+		if (ZSTD_isError(retlen) || (retlen != block_size)) {
+			error(INFO, "%s: uncompress failed: %d (%s)\n",
+				DISKDUMP_VALID() ? "diskdump" : "compressed kdump",
+				retlen, ZSTD_getErrorName(retlen));
 			return READ_ERROR;
 		}
 #endif
@@ -1467,6 +1521,12 @@ get_diskdump_regs_arm64(struct bt_info *bt, ulong *eip, ulong *esp)
 }
 
 static void
+get_diskdump_regs_mips(struct bt_info *bt, ulong *eip, ulong *esp)
+{
+	machdep->get_stack_frame(bt, eip, esp);
+}
+
+static void
 get_diskdump_regs_sparc64(struct bt_info *bt, ulong *eip, ulong *esp)
 {
 	Elf64_Nhdr *note;
@@ -1505,7 +1565,7 @@ get_diskdump_regs(struct bt_info *bt, ulong *eip, ulong *esp)
 		break;
 
 	case EM_MIPS:
-		return get_diskdump_regs_32(bt, eip, esp);
+		return get_diskdump_regs_mips(bt, eip, esp);
 		break;
 
 	case EM_386:
@@ -1691,7 +1751,7 @@ dump_note_offsets(FILE *fp)
 			qemu = FALSE;
 			if (machine_type("X86_64") || machine_type("S390X") ||
 			    machine_type("ARM64") || machine_type("PPC64") ||
-			    machine_type("SPARC64")) {
+			    machine_type("SPARC64") || machine_type("MIPS64")) {
 				note64 = (void *)dd->notes_buf + tot;
 				len = sizeof(Elf64_Nhdr);
 				if (STRNEQ((char *)note64 + len, "QEMU"))
@@ -1774,6 +1834,8 @@ __diskdump_memory_dump(FILE *fp)
 		fprintf(fp, "%sLZO_SUPPORTED", others++ ? "|" : "");
 	if (dd->flags & SNAPPY_SUPPORTED)
 		fprintf(fp, "%sSNAPPY_SUPPORTED", others++ ? "|" : "");
+	if (dd->flags & ZSTD_SUPPORTED)
+		fprintf(fp, "%sZSTD_SUPPORTED", others++ ? "|" : "");
         fprintf(fp, ") %s\n", FLAT_FORMAT() ? "[FLAT]" : "");
         fprintf(fp, "               dfd: %d\n", dd->dfd);
         fprintf(fp, "               ofp: %lx\n", (ulong)dd->ofp);
@@ -1840,6 +1902,8 @@ __diskdump_memory_dump(FILE *fp)
 			fprintf(fp, "DUMP_DH_COMPRESSED_LZO");
 		if (dh->status & DUMP_DH_COMPRESSED_SNAPPY)
 			fprintf(fp, "DUMP_DH_COMPRESSED_SNAPPY");
+		if (dh->status & DUMP_DH_COMPRESSED_ZSTD)
+			fprintf(fp, "DUMP_DH_COMPRESSED_ZSTD");
 		if (dh->status & DUMP_DH_COMPRESSED_INCOMPLETE)
 			fprintf(fp, "DUMP_DH_COMPRESSED_INCOMPLETE");
 		if (dh->status & DUMP_DH_EXCLUDED_VMEMMAP)
@@ -2074,6 +2138,7 @@ __diskdump_memory_dump(FILE *fp)
 	else
 		fprintf(fp, "\n");
 	fprintf(fp, "       valid_pages: %lx\n", (ulong)dd->valid_pages);
+	fprintf(fp, " total_valid_pages: %ld\n", dd->valid_pages[dd->max_sect_len]);
 
 	return 0;
 }
@@ -2477,6 +2542,12 @@ diskdump_display_regs(int cpu, FILE *ofp)
 		    UINT(user_regs + OFFSET(user_regs_struct_eflags))
 		);
 	}
+
+	if (machine_type("MIPS"))
+		mips_display_regs_from_elf_notes(cpu, ofp);
+
+	if (machine_type("MIPS64"))
+		mips64_display_regs_from_elf_notes(cpu, ofp);
 }
 
 void
@@ -2485,8 +2556,9 @@ dump_registers_for_compressed_kdump(void)
 	int c;
 
 	if (!KDUMP_CMPRS_VALID() || (dd->header->header_version < 4) ||
-	    !(machine_type("X86") || machine_type("X86_64") || 
-	      machine_type("ARM64") || machine_type("PPC64")))
+	    !(machine_type("X86") || machine_type("X86_64") ||
+	      machine_type("ARM64") || machine_type("PPC64") ||
+	      machine_type("MIPS") || machine_type("MIPS64")))
 		error(FATAL, "-r option not supported for this dumpfile\n");
 
 	if (machine_type("ARM64") && (kt->cpus != dd->num_prstatus_notes))
@@ -2514,6 +2586,21 @@ diskdump_kaslr_check()
 		return TRUE;
 
 	return FALSE;
+}
+
+int
+diskdump_get_nr_cpus(void)
+{
+        if (dd->num_prstatus_notes)
+                return dd->num_prstatus_notes;
+        else if (dd->num_qemu_notes)
+                return dd->num_qemu_notes;
+        else if (dd->num_vmcoredd_notes)
+                return dd->num_vmcoredd_notes;
+        else if (dd->header->nr_cpus)
+                return dd->header->nr_cpus;
+
+        return 1;
 }
 
 #ifdef X86_64
@@ -2583,4 +2670,291 @@ diskdump_device_dump_info(FILE *ofp)
 			  dd->notes_buf);
 		devdump_info(dd->nt_vmcoredd_array[i], offset, ofp);
 	}
+}
+
+static void
+zram_init(void)
+{
+	MEMBER_OFFSET_INIT(zram_mempoll, "zram", "mem_pool");
+	MEMBER_OFFSET_INIT(zram_compressor, "zram", "compressor");
+	MEMBER_OFFSET_INIT(zram_table_flag, "zram_table_entry", "flags");
+	if (INVALID_MEMBER(zram_table_flag))
+		MEMBER_OFFSET_INIT(zram_table_flag, "zram_table_entry", "value");
+	STRUCT_SIZE_INIT(zram_table_entry, "zram_table_entry");
+}
+
+static unsigned char *
+zram_object_addr(ulong pool, ulong handle, unsigned char *zram_buf)
+{
+	ulong obj, off, class, page, zspage;
+	struct zspage zspage_s;
+	physaddr_t paddr;
+	unsigned int obj_idx, class_idx, size;
+	ulong pages[2], sizes[2];
+
+	readmem(handle, KVADDR, &obj, sizeof(void *), "zram entry", FAULT_ON_ERROR);
+	obj >>= OBJ_TAG_BITS;
+	phys_to_page(PTOB(obj >> OBJ_INDEX_BITS), &page);
+	obj_idx = (obj & OBJ_INDEX_MASK);
+
+	readmem(page + OFFSET(page_private), KVADDR, &zspage,
+			sizeof(void *), "page_private", FAULT_ON_ERROR);
+	readmem(zspage, KVADDR, &zspage_s, sizeof(struct zspage), "zspage", FAULT_ON_ERROR);
+
+	class_idx = zspage_s.class;
+	if (zspage_s.magic != ZSPAGE_MAGIC)
+		error(FATAL, "zspage magic incorrect: %x\n", zspage_s.magic);
+
+	class = pool + OFFSET(zspoll_size_class);
+	class += (class_idx * sizeof(void *));
+	readmem(class, KVADDR, &class, sizeof(void *), "size_class", FAULT_ON_ERROR);
+	readmem(class + OFFSET(size_class_size), KVADDR,
+			&size, sizeof(unsigned int), "size of class_size", FAULT_ON_ERROR);
+	off = (size * obj_idx) & (~machdep->pagemask);
+	if (off + size <= PAGESIZE()) {
+		if (!is_page_ptr(page, &paddr)) {
+			error(WARNING, "zspage: %lx: not a page pointer\n", page);
+			return NULL;
+		}
+		readmem(paddr + off, PHYSADDR, zram_buf, size, "zram buffer", FAULT_ON_ERROR);
+		goto out;
+	}
+
+	pages[0] = page;
+	readmem(page + OFFSET(page_freelist), KVADDR, &pages[1],
+			sizeof(void *), "page_freelist", FAULT_ON_ERROR);
+	sizes[0] = PAGESIZE() - off;
+	sizes[1] = size - sizes[0];
+	if (!is_page_ptr(pages[0], &paddr)) {
+		error(WARNING, "pages[0]: %lx: not a page pointer\n", pages[0]);
+		return NULL;
+	}
+
+	readmem(paddr + off, PHYSADDR, zram_buf, sizes[0], "zram buffer[0]", FAULT_ON_ERROR);
+	if (!is_page_ptr(pages[1], &paddr)) {
+		error(WARNING, "pages[1]: %lx: not a page pointer\n", pages[1]);
+		return NULL;
+	}
+
+	readmem(paddr, PHYSADDR, zram_buf + sizes[0], sizes[1], "zram buffer[1]", FAULT_ON_ERROR);
+
+out:
+	readmem(page, KVADDR, &obj, sizeof(void *), "page flags", FAULT_ON_ERROR);
+	if (!(obj & (1<<10))) { //PG_OwnerPriv1 flag
+		return (zram_buf + ZS_HANDLE_SIZE);
+	}
+
+	return zram_buf;
+}
+
+static unsigned char *
+lookup_swap_cache(ulonglong pte_val, unsigned char *zram_buf)
+{
+	ulonglong swp_offset;
+	ulong swp_type, swp_space, page;
+	struct list_pair lp;
+	physaddr_t paddr;
+	static int is_xarray = -1;
+
+	if (is_xarray < 0) {
+		is_xarray = STREQ(MEMBER_TYPE_NAME("address_space", "i_pages"), "xarray");
+	}
+
+	swp_type = __swp_type(pte_val);
+	if (THIS_KERNEL_VERSION >= LINUX(2,6,0)) {
+		swp_offset = (ulonglong)__swp_offset(pte_val);
+	} else {
+		swp_offset = (ulonglong)SWP_OFFSET(pte_val);
+	}
+
+	if (!symbol_exists("swapper_spaces"))
+		return NULL;
+	swp_space = symbol_value("swapper_spaces");
+	swp_space += swp_type * sizeof(void *);
+
+	readmem(swp_space, KVADDR, &swp_space, sizeof(void *),
+			"swp_spaces", FAULT_ON_ERROR);
+	swp_space += (swp_offset >> SWAP_ADDRESS_SPACE_SHIFT) * SIZE(address_space);
+
+	lp.index = swp_offset;
+	if ((is_xarray ? do_xarray : do_radix_tree)(swp_space, RADIX_TREE_SEARCH, &lp)) {
+		readmem((ulong)lp.value, KVADDR, &page, sizeof(void *),
+				"swap_cache page", FAULT_ON_ERROR);
+		if (!is_page_ptr(page, &paddr)) {
+			error(WARNING, "radix page: %lx: not a page pointer\n", lp.value);
+			return NULL;
+		}
+		readmem(paddr, PHYSADDR, zram_buf, PAGESIZE(), "zram buffer", FAULT_ON_ERROR);
+		return zram_buf;
+	}
+	return NULL;
+}
+
+static int get_disk_name_private_data(ulonglong pte_val, ulonglong vaddr,
+				       char *name, ulong *private_data)
+{
+	ulong swap_info, bdev, bd_disk;
+
+	if (!symbol_exists("swap_info"))
+		return FALSE;
+
+	swap_info = symbol_value("swap_info");
+
+	swap_info_init();
+	if (vt->flags & SWAPINFO_V2) {
+		swap_info += (__swp_type(pte_val) * sizeof(void *));
+		readmem(swap_info, KVADDR, &swap_info,
+				sizeof(void *), "swap_info", FAULT_ON_ERROR);
+	} else {
+		swap_info += (SIZE(swap_info_struct) * __swp_type(pte_val));
+	}
+
+	readmem(swap_info + OFFSET(swap_info_struct_bdev), KVADDR, &bdev,
+			sizeof(void *), "swap_info_struct_bdev", FAULT_ON_ERROR);
+	readmem(bdev + OFFSET(block_device_bd_disk), KVADDR, &bd_disk,
+			sizeof(void *), "block_device_bd_disk", FAULT_ON_ERROR);
+	if (name)
+		readmem(bd_disk + OFFSET(gendisk_disk_name), KVADDR, name,
+			strlen("zram"), "gendisk_disk_name", FAULT_ON_ERROR);
+	if (private_data)
+		readmem(bd_disk + OFFSET(gendisk_private_data), KVADDR,
+			private_data, sizeof(void *), "gendisk_private_data",
+			FAULT_ON_ERROR);
+
+	return TRUE;
+}
+
+ulong readswap(ulonglong pte_val, char *buf, ulong len, ulonglong vaddr)
+{
+	char name[32] = {0};
+
+	if (!get_disk_name_private_data(pte_val, vaddr, name, NULL))
+		return 0;
+
+	if (!strncmp(name, "zram", 4)) {
+		return try_zram_decompress(pte_val, (unsigned char *)buf, len, vaddr);
+	} else {
+		if (CRASHDEBUG(2))
+			error(WARNING, "this page has been swapped to %s\n", name);
+		return 0;
+	}
+}
+
+ulong (*decompressor)(unsigned char *in_addr, ulong in_size, unsigned char *out_addr,
+			ulong *out_size, void *other/* NOT USED */);
+/*
+ * If userspace address was swapped out to zram, this function is called to decompress the object.
+ * try_zram_decompress returns decompressed page data and data length
+ */
+ulong
+try_zram_decompress(ulonglong pte_val, unsigned char *buf, ulong len, ulonglong vaddr)
+{
+	char name[32] = {0};
+	ulonglong swp_offset;
+	unsigned char *obj_addr = NULL;
+	unsigned char *zram_buf = NULL;
+	unsigned char *outbuf = NULL;
+	ulong zram, zram_table_entry, sector, index, entry, flags, size,
+		outsize, off;
+
+	if (INVALID_MEMBER(zram_compressor)) {
+		zram_init();
+		if (INVALID_MEMBER(zram_compressor)) {
+			error(WARNING,
+			      "Some pages are swapped out to zram. "
+			      "Please run mod -s zram.\n");
+			return 0;
+		}
+	}
+
+	if (CRASHDEBUG(2))
+		error(WARNING, "this page has swapped to zram\n");
+
+	if (!get_disk_name_private_data(pte_val, vaddr, NULL, &zram))
+		return 0;
+
+	readmem(zram + OFFSET(zram_compressor), KVADDR, name,
+		sizeof(name), "zram compressor", FAULT_ON_ERROR);
+	if (STREQ(name, "lzo")) {
+#ifdef LZO
+		if (!(dd->flags & LZO_SUPPORTED)) {
+			if (lzo_init() == LZO_E_OK)
+				dd->flags |= LZO_SUPPORTED;
+			else
+				return 0;
+		}
+		decompressor = (void *)lzo1x_decompress_safe;
+#else
+		error(WARNING,
+		      "zram decompress error: this executable needs to be built"
+		      " with lzo library\n");
+		return 0;
+#endif
+	} else { /* todo: support more compressor */
+		error(WARNING, "only the lzo compressor is supported\n");
+		return 0;
+	}
+
+	if (THIS_KERNEL_VERSION >= LINUX(2, 6, 0)) {
+		swp_offset = (ulonglong)__swp_offset(pte_val);
+	} else {
+		swp_offset = (ulonglong)SWP_OFFSET(pte_val);
+	}
+
+	zram_buf = (unsigned char *)GETBUF(PAGESIZE());
+	/* lookup page from swap cache */
+	off = PAGEOFFSET(vaddr);
+	obj_addr = lookup_swap_cache(pte_val, zram_buf);
+	if (obj_addr != NULL) {
+		memcpy(buf, obj_addr + off, len);
+		goto out;
+	}
+
+	sector = swp_offset << (PAGESHIFT() - 9);
+	index = sector >> SECTORS_PER_PAGE_SHIFT;
+	readmem(zram, KVADDR, &zram_table_entry,
+		sizeof(void *), "zram_table_entry", FAULT_ON_ERROR);
+	zram_table_entry += (index * SIZE(zram_table_entry));
+	readmem(zram_table_entry, KVADDR, &entry,
+		sizeof(void *), "entry of table", FAULT_ON_ERROR);
+	readmem(zram_table_entry + OFFSET(zram_table_flag), KVADDR, &flags,
+		sizeof(void *), "zram_table_flag", FAULT_ON_ERROR);
+	if (!entry || (flags & ZRAM_FLAG_SAME_BIT)) {
+		memset(buf, entry, len);
+		goto out;
+	}
+	size = flags & (ZRAM_FLAG_SHIFT -1);
+	if (size == 0) {
+		len = 0;
+		goto out;
+	}
+
+	readmem(zram + OFFSET(zram_mempoll), KVADDR, &zram,
+		sizeof(void *), "zram_mempoll", FAULT_ON_ERROR);
+
+	obj_addr = zram_object_addr(zram, entry, zram_buf);
+	if (obj_addr == NULL) {
+		len = 0;
+		goto out;
+	}
+
+	if (size == PAGESIZE()) {
+		memcpy(buf, obj_addr + off, len);
+	} else {
+		outbuf = (unsigned char *)GETBUF(PAGESIZE());
+		outsize = PAGESIZE();
+		if (!decompressor(obj_addr, size, outbuf, &outsize, NULL))
+			memcpy(buf, outbuf + off, len);
+		else {
+			error(WARNING, "zram decompress error\n");
+			len = 0;
+		}
+		FREEBUF(outbuf);
+	}
+
+out:
+	if (len && CRASHDEBUG(2))
+		error(INFO, "%lx: zram decompress success\n", vaddr);
+	FREEBUF(zram_buf);
+	return len;
 }

@@ -24,6 +24,7 @@ static void dump_blkdevs_v2(ulong);
 static void dump_blkdevs_v3(ulong);
 static ulong search_cdev_map_probes(char *, int, int, ulong *);
 static ulong search_bdev_map_probes(char *, int, int, ulong *);
+static ulong search_blockdev_inodes(int, ulong *);
 static void do_pci(void); 
 static void do_pci2(void);
 static void do_io(void);
@@ -493,9 +494,10 @@ dump_blkdevs(ulong flags)
                 ulong ops;
         } blkdevs[MAX_DEV], *bp;
 
-	if (kernel_symbol_exists("major_names") && 
-	    kernel_symbol_exists("bdev_map")) {
-                dump_blkdevs_v3(flags);
+	if (kernel_symbol_exists("major_names") &&
+	    (kernel_symbol_exists("bdev_map") ||
+	     kernel_symbol_exists("blockdev_superblock"))) {
+		dump_blkdevs_v3(flags);
 		return;
 	}
 
@@ -717,6 +719,7 @@ dump_blkdevs_v3(ulong flags)
 	char buf[BUFSIZE];
 	uint major;
 	ulong gendisk, addr, fops;
+	int use_bdev_map = kernel_symbol_exists("bdev_map");
 	
 	if (!(len = get_array_length("major_names", NULL, 0)))
 		len = MAX_DEV;
@@ -745,8 +748,11 @@ dump_blkdevs_v3(ulong flags)
 		strncpy(buf, blk_major_name_buf +  
 			OFFSET(blk_major_name_name), 16);
 
-		fops = search_bdev_map_probes(buf, major == i ? major : i, 
-			UNUSED, &gendisk);
+		if (use_bdev_map)
+			fops = search_bdev_map_probes(buf, major == i ? major : i,
+				UNUSED, &gendisk);
+		else /* v5.11 and later */
+			fops = search_blockdev_inodes(major, &gendisk);
 
 		if (CRASHDEBUG(1))
 			fprintf(fp, "blk_major_name: %lx block major: %d name: %s gendisk: %lx fops: %lx\n", 
@@ -825,6 +831,67 @@ search_bdev_map_probes(char *name, int major, int minor, ulong *gendisk)
 	}
 
 	FREEBUF(probe_buf);
+	FREEBUF(gendisk_buf);
+	return fops;
+}
+
+/* For bdev_inode.  See block/bdev.c */
+#define I_BDEV(inode) (inode - SIZE(block_device))
+
+static ulong
+search_blockdev_inodes(int major, ulong *gendisk)
+{
+	struct list_data list_data, *ld;
+	ulong addr, bd_sb, disk, fops = 0;
+	int i, inode_count, gendisk_major;
+	char *gendisk_buf;
+
+	ld = &list_data;
+	BZERO(ld, sizeof(struct list_data));
+
+	get_symbol_data("blockdev_superblock", sizeof(void *), &bd_sb);
+
+	addr = bd_sb + OFFSET(super_block_s_inodes);
+	if (!readmem(addr, KVADDR, &ld->start, sizeof(ulong),
+	    "blockdev_superblock.s_inodes", QUIET|RETURN_ON_ERROR))
+		return 0;
+
+	if (empty_list(ld->start))
+		return 0;
+
+	ld->flags |= LIST_ALLOCATE;
+	ld->end = bd_sb + OFFSET(super_block_s_inodes);
+	ld->list_head_offset = OFFSET(inode_i_sb_list);
+
+	inode_count = do_list(ld);
+
+	gendisk_buf = GETBUF(SIZE(gendisk));
+
+	for (i = 0; i < inode_count; i++) {
+		addr = I_BDEV(ld->list_ptr[i]) + OFFSET(block_device_bd_disk);
+		if (!readmem(addr, KVADDR, &disk, sizeof(ulong),
+		    "block_device.bd_disk", QUIET|RETURN_ON_ERROR))
+			continue;
+
+		if (!disk)
+			continue;
+
+		if (!readmem(disk, KVADDR, gendisk_buf, SIZE(gendisk),
+		    "gendisk buffer", QUIET|RETURN_ON_ERROR))
+			continue;
+
+		gendisk_major = INT(gendisk_buf + OFFSET(gendisk_major));
+		if (gendisk_major != major)
+			continue;
+
+		fops = ULONG(gendisk_buf + OFFSET(gendisk_fops));
+		if (fops) {
+			*gendisk = disk;
+			break;
+		}
+	}
+
+	FREEBUF(ld->list_ptr);
 	FREEBUF(gendisk_buf);
 	return fops;
 }
@@ -4067,13 +4134,22 @@ get_gendisk_5(unsigned long entry)
 {
 	unsigned long device_address;
 	unsigned long device_private_address;
+	unsigned long gendisk;
 
 	device_private_address = entry - OFFSET(device_private_knode_class);
 	readmem(device_private_address + OFFSET(device_private_device),
 		KVADDR, &device_address, sizeof(device_address),
 		"device_private.device", FAULT_ON_ERROR);
 
-	return device_address - OFFSET(hd_struct_dev) - OFFSET(gendisk_part0);
+	if (VALID_MEMBER(hd_struct_dev))
+		return device_address - OFFSET(hd_struct_dev) - OFFSET(gendisk_part0);
+
+	/* kernel version >= 5.11 */
+	readmem(device_address - OFFSET(block_device_bd_device) +
+		OFFSET(block_device_bd_disk), KVADDR, &gendisk,
+		sizeof(ulong), "block_device.bd_disk", FAULT_ON_ERROR);
+
+	return gendisk;
 }
 
 /* 2.6.24 < kernel version <= 2.6.27 */
@@ -4229,15 +4305,219 @@ get_one_mctx_diskio(unsigned long mctx, struct diskio *io)
 	io->write = (dispatch[1] - comp[1]);
 }
 
+typedef bool (busy_tag_iter_fn)(ulong rq, void *data);
+
+struct mq_inflight {
+	ulong q;
+	struct diskio *dio;
+};
+
+struct bt_iter_data {
+	ulong tags;
+	uint reserved;
+	uint nr_reserved_tags;
+	busy_tag_iter_fn *fn;
+	void *data;
+};
+
+/*
+ * See the include/linux/blk_types.h and include/linux/blk-mq.h
+ */
+#define MQ_RQ_IN_FLIGHT 1
+#define REQ_OP_BITS     8
+#define REQ_OP_MASK     ((1 << REQ_OP_BITS) - 1)
+
+static uint op_is_write(uint op)
+{
+	return (op & REQ_OP_MASK) & 1;
+}
+
+static bool mq_check_inflight(ulong rq, void *data)
+{
+	uint cmd_flags = 0, state = 0;
+	ulong addr = 0, queue = 0;
+	struct mq_inflight *mi = data;
+
+	if (!IS_KVADDR(rq))
+		return TRUE;
+
+	addr = rq + OFFSET(request_q);
+	if (!readmem(addr, KVADDR, &queue, sizeof(ulong), "request.q", RETURN_ON_ERROR))
+		return FALSE;
+
+	addr = rq + OFFSET(request_cmd_flags);
+	if (!readmem(addr, KVADDR, &cmd_flags, sizeof(uint), "request.cmd_flags", RETURN_ON_ERROR))
+		return FALSE;
+
+	addr = rq + OFFSET(request_state);
+	if (!readmem(addr, KVADDR, &state, sizeof(uint), "request.state", RETURN_ON_ERROR))
+		return FALSE;
+
+	if (queue == mi->q && state == MQ_RQ_IN_FLIGHT) {
+		if (op_is_write(cmd_flags))
+			mi->dio->write++;
+		else
+			mi->dio->read++;
+	}
+
+	return TRUE;
+}
+
+static bool bt_iter(uint bitnr, void *data)
+{
+	ulong addr = 0, rqs_addr = 0, rq = 0;
+	struct bt_iter_data *iter_data = data;
+	ulong tag = iter_data->tags;
+
+	if (!iter_data->reserved)
+		bitnr += iter_data->nr_reserved_tags;
+
+	/* rqs */
+	addr = tag + OFFSET(blk_mq_tags_rqs);
+	if (!readmem(addr, KVADDR, &rqs_addr, sizeof(void *), "blk_mq_tags.rqs", RETURN_ON_ERROR))
+		return FALSE;
+
+	addr = rqs_addr + bitnr * sizeof(ulong); /* rqs[bitnr] */
+	if (!readmem(addr, KVADDR, &rq, sizeof(ulong), "blk_mq_tags.rqs[]", RETURN_ON_ERROR))
+		return FALSE;
+
+	return iter_data->fn(rq, iter_data->data);
+}
+
+static void bt_for_each(ulong q, ulong tags, ulong sbq, uint reserved, uint nr_resvd_tags, struct diskio *dio)
+{
+	struct sbitmap_context sc = {0};
+	struct mq_inflight mi = {
+		.q = q,
+		.dio = dio,
+	};
+	struct bt_iter_data iter_data = {
+		.tags = tags,
+		.reserved = reserved,
+		.nr_reserved_tags = nr_resvd_tags,
+		.fn = mq_check_inflight,
+		.data = &mi,
+	};
+
+	sbitmap_context_load(sbq + OFFSET(sbitmap_queue_sb), &sc);
+	sbitmap_for_each_set(&sc, bt_iter, &iter_data);
+}
+
+static void queue_for_each_hw_ctx(ulong q, ulong *hctx, uint cnt, struct diskio *dio)
+{
+	uint i;
+	int bitmap_tags_is_ptr = 0;
+
+	if (MEMBER_TYPE("blk_mq_tags", "bitmap_tags") == TYPE_CODE_PTR)
+		bitmap_tags_is_ptr = 1;
+
+	for (i = 0; i < cnt; i++) {
+		ulong addr = 0, tags = 0;
+		uint nr_reserved_tags = 0;
+
+		/* Tags owned by the block driver */
+		addr = hctx[i] + OFFSET(blk_mq_hw_ctx_tags);
+		if (!readmem(addr, KVADDR, &tags, sizeof(ulong),
+				"blk_mq_hw_ctx.tags", RETURN_ON_ERROR))
+			break;
+
+		addr = tags + OFFSET(blk_mq_tags_nr_reserved_tags);
+		if (!readmem(addr, KVADDR, &nr_reserved_tags, sizeof(uint),
+				"blk_mq_tags_nr_reserved_tags", RETURN_ON_ERROR))
+			break;
+
+		if (nr_reserved_tags) {
+			addr = tags + OFFSET(blk_mq_tags_breserved_tags);
+			if (bitmap_tags_is_ptr &&
+			    !readmem(addr, KVADDR, &addr, sizeof(ulong),
+					"blk_mq_tags.bitmap_tags", RETURN_ON_ERROR))
+				break;
+			bt_for_each(q, tags, addr, 1, nr_reserved_tags, dio);
+		}
+		addr = tags + OFFSET(blk_mq_tags_bitmap_tags);
+		if (bitmap_tags_is_ptr &&
+		    !readmem(addr, KVADDR, &addr, sizeof(ulong),
+				"blk_mq_tags.bitmap_tags", RETURN_ON_ERROR))
+			break;
+		bt_for_each(q, tags, addr, 0, nr_reserved_tags, dio);
+	}
+}
+
+static void get_mq_diskio_from_hw_queues(ulong q, struct diskio *dio)
+{
+	uint cnt = 0;
+	ulong addr = 0, hctx_addr = 0;
+	ulong *hctx_array = NULL;
+	struct list_pair *lp = NULL;
+
+	if (VALID_MEMBER(request_queue_hctx_table)) {
+		addr = q + OFFSET(request_queue_hctx_table);
+		cnt = do_xarray(addr, XARRAY_COUNT, NULL);
+		lp = (struct list_pair *)GETBUF(sizeof(struct list_pair) * (cnt + 1));
+		if (!lp)
+			error(FATAL, "fail to get memory for list_pair.\n");
+		lp[0].index = cnt;
+		cnt = do_xarray(addr, XARRAY_GATHER, lp);
+	} else {
+		addr = q + OFFSET(request_queue_nr_hw_queues);
+		readmem(addr, KVADDR, &cnt, sizeof(uint),
+			"request_queue.nr_hw_queues", FAULT_ON_ERROR);
+
+		addr = q + OFFSET(request_queue_queue_hw_ctx);
+		readmem(addr, KVADDR, &hctx_addr, sizeof(void *),
+			"request_queue.queue_hw_ctx", FAULT_ON_ERROR);
+	}
+
+	hctx_array = (ulong *)GETBUF(sizeof(void *) * cnt);
+	if (!hctx_array) {
+		if (lp)
+			FREEBUF(lp);
+		error(FATAL, "fail to get memory for the hctx_array\n");
+	}
+
+	if (lp && hctx_array) {
+		uint i;
+
+		/* copy it from list_pair to hctx_array */
+		for (i = 0; i < cnt; i++)
+			hctx_array[i] = (ulong)lp[i].value;
+
+		FREEBUF(lp);
+	} else if (!readmem(hctx_addr, KVADDR, hctx_array, sizeof(void *) * cnt,
+			"request_queue.queue_hw_ctx[]", RETURN_ON_ERROR)) {
+		FREEBUF(hctx_array);
+		return;
+	}
+
+	queue_for_each_hw_ctx(q, hctx_array, cnt, dio);
+
+	FREEBUF(hctx_array);
+}
+
 static void
 get_mq_diskio(unsigned long q, unsigned long *mq_count)
 {
 	int cpu;
 	unsigned long queue_ctx;
 	unsigned long mctx_addr;
-	struct diskio tmp;
+	struct diskio tmp = {0};
 
-	memset(&tmp, 0x00, sizeof(struct diskio));
+	/*
+	 * Currently this function does not support old blk-mq implementation
+	 * before 12f5b9314545 ("blk-mq: Remove generation seqeunce"), so
+	 * filter them out.
+	 */
+	if (VALID_MEMBER(request_state)) {
+		if (CRASHDEBUG(1))
+			fprintf(fp, "mq: using sbitmap\n");
+		get_mq_diskio_from_hw_queues(q, &tmp);
+		mq_count[0] = tmp.read;
+		mq_count[1] = tmp.write;
+		return;
+	}
+
+	if (CRASHDEBUG(1))
+		fprintf(fp, "mq: using blk_mq_ctx.rq_{completed,dispatched} counters\n");
 
 	readmem(q + OFFSET(request_queue_queue_ctx), KVADDR, &queue_ctx,
 		sizeof(ulong), "request_queue.queue_ctx",
@@ -4290,9 +4570,19 @@ get_diskio_1(unsigned long rq, unsigned long gendisk, struct diskio *io)
 			io->read = count[0];
 			io->write = count[1];
 		} else {
-			readmem(gendisk + OFFSET(gendisk_part0) +
-				OFFSET(hd_struct_dkstats), KVADDR, &dkstats,
-				sizeof(ulong), "gendisk.part0.dkstats", FAULT_ON_ERROR);
+			if (VALID_MEMBER(hd_struct_dkstats))
+				readmem(gendisk + OFFSET(gendisk_part0) +
+					OFFSET(hd_struct_dkstats), KVADDR, &dkstats,
+					sizeof(ulong), "gendisk.part0.dkstats", FAULT_ON_ERROR);
+			else { /* kernel version >= 5.11 */
+				ulong block_device;
+				readmem(gendisk + OFFSET(gendisk_part0), KVADDR, &block_device,
+					sizeof(ulong), "gendisk.part0", FAULT_ON_ERROR);
+				readmem(block_device + OFFSET(block_device_bd_stats), KVADDR,
+					&dkstats, sizeof(ulong), "block_device.bd_stats",
+					FAULT_ON_ERROR);
+			}
+
 			get_one_diskio_from_dkstats(dkstats, io_counts);
 
 			io->read = io_counts[0];
@@ -4549,12 +4839,17 @@ void diskio_init(void)
 	MEMBER_OFFSET_INIT(gendisk_queue, "gendisk", "queue");
 	MEMBER_OFFSET_INIT(hd_struct_dev, "hd_struct", "__dev");
 	MEMBER_OFFSET_INIT(hd_struct_dkstats, "hd_struct", "dkstats");
+	MEMBER_OFFSET_INIT(block_device_bd_device, "block_device", "bd_device");
+	MEMBER_OFFSET_INIT(block_device_bd_stats, "block_device", "bd_stats");
 	MEMBER_OFFSET_INIT(klist_k_list, "klist", "k_list");
 	MEMBER_OFFSET_INIT(klist_node_n_klist, "klist_node", "n_klist");
 	MEMBER_OFFSET_INIT(klist_node_n_node, "klist_node", "n_node");
 	MEMBER_OFFSET_INIT(kobject_entry, "kobject", "entry");
 	MEMBER_OFFSET_INIT(kset_list, "kset", "list");
 	MEMBER_OFFSET_INIT(request_list_count, "request_list", "count");
+	MEMBER_OFFSET_INIT(request_cmd_flags, "request", "cmd_flags");
+	MEMBER_OFFSET_INIT(request_q, "request", "q");
+	MEMBER_OFFSET_INIT(request_state, "request", "state");
 	MEMBER_OFFSET_INIT(request_queue_in_flight, "request_queue",
 		"in_flight");
 	if (MEMBER_EXISTS("request_queue", "rq"))
@@ -4566,10 +4861,35 @@ void diskio_init(void)
 			"mq_ops");
 		ANON_MEMBER_OFFSET_INIT(request_queue_queue_ctx,
 			"request_queue", "queue_ctx");
+		MEMBER_OFFSET_INIT(request_queue_queue_hw_ctx,
+			"request_queue", "queue_hw_ctx");
+		MEMBER_OFFSET_INIT(request_queue_nr_hw_queues,
+			"request_queue", "nr_hw_queues");
+		MEMBER_OFFSET_INIT(request_queue_hctx_table,
+			"request_queue", "hctx_table");
 		MEMBER_OFFSET_INIT(blk_mq_ctx_rq_dispatched, "blk_mq_ctx",
 			"rq_dispatched");
 		MEMBER_OFFSET_INIT(blk_mq_ctx_rq_completed, "blk_mq_ctx",
 			"rq_completed");
+		MEMBER_OFFSET_INIT(blk_mq_hw_ctx_tags, "blk_mq_hw_ctx", "tags");
+		MEMBER_OFFSET_INIT(blk_mq_tags_bitmap_tags, "blk_mq_tags",
+			"bitmap_tags");
+		MEMBER_OFFSET_INIT(blk_mq_tags_breserved_tags, "blk_mq_tags",
+			"breserved_tags");
+		MEMBER_OFFSET_INIT(blk_mq_tags_nr_reserved_tags, "blk_mq_tags",
+			"nr_reserved_tags");
+		MEMBER_OFFSET_INIT(blk_mq_tags_rqs, "blk_mq_tags", "rqs");
+		STRUCT_SIZE_INIT(blk_mq_tags, "blk_mq_tags");
+		STRUCT_SIZE_INIT(sbitmap, "sbitmap");
+		STRUCT_SIZE_INIT(sbitmap_word, "sbitmap_word");
+		MEMBER_OFFSET_INIT(sbitmap_word_word, "sbitmap_word", "word");
+		MEMBER_OFFSET_INIT(sbitmap_word_cleared, "sbitmap_word", "cleared");
+		MEMBER_OFFSET_INIT(sbitmap_depth, "sbitmap", "depth");
+		MEMBER_OFFSET_INIT(sbitmap_shift, "sbitmap", "shift");
+		MEMBER_OFFSET_INIT(sbitmap_map_nr, "sbitmap", "map_nr");
+		MEMBER_OFFSET_INIT(sbitmap_map, "sbitmap", "map");
+		MEMBER_OFFSET_INIT(sbitmap_queue_sb, "sbitmap_queue", "sb");
+
 	}
 	MEMBER_OFFSET_INIT(subsys_private_klist_devices, "subsys_private",
 		"klist_devices");

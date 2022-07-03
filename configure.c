@@ -104,7 +104,9 @@ void add_extra_lib(char *);
 #undef X86_64
 #undef ARM
 #undef ARM64
+#undef MIPS
 #undef SPARC64
+#undef MIPS64
 
 #define UNKNOWN 0
 #define X86     1
@@ -119,6 +121,7 @@ void add_extra_lib(char *);
 #define ARM64   10
 #define MIPS    11
 #define SPARC64 12
+#define MIPS64  13
 
 #define TARGET_X86    "TARGET=X86"
 #define TARGET_ALPHA  "TARGET=ALPHA"
@@ -131,6 +134,7 @@ void add_extra_lib(char *);
 #define TARGET_ARM    "TARGET=ARM"
 #define TARGET_ARM64  "TARGET=ARM64"
 #define TARGET_MIPS   "TARGET=MIPS"
+#define TARGET_MIPS64 "TARGET=MIPS64"
 #define TARGET_SPARC64 "TARGET=SPARC64"
 
 #define TARGET_CFLAGS_X86    "TARGET_CFLAGS=-D_FILE_OFFSET_BITS=64"
@@ -152,17 +156,18 @@ void add_extra_lib(char *);
 #define TARGET_CFLAGS_MIPS            "TARGET_CFLAGS=-D_FILE_OFFSET_BITS=64"
 #define TARGET_CFLAGS_MIPS_ON_X86     "TARGET_CFLAGS=-D_FILE_OFFSET_BITS=64"
 #define TARGET_CFLAGS_MIPS_ON_X86_64  "TARGET_CFLAGS=-m32 -D_FILE_OFFSET_BITS=64"
+#define TARGET_CFLAGS_MIPS64          "TARGET_CFLAGS="
 #define TARGET_CFLAGS_SPARC64         "TARGET_CFLAGS="
 
 #define GDB_TARGET_DEFAULT        "GDB_CONF_FLAGS="
 #define GDB_TARGET_ARM_ON_X86     "GDB_CONF_FLAGS=--target=arm-elf-linux"
-#define GDB_TARGET_ARM_ON_X86_64  "GDB_CONF_FLAGS=--target=arm-elf-linux CFLAGS=-m32"
-#define GDB_TARGET_X86_ON_X86_64  "GDB_CONF_FLAGS=--target=i686-pc-linux-gnu CFLAGS=-m32"
-#define GDB_TARGET_PPC_ON_PPC64   "GDB_CONF_FLAGS=--target=ppc-elf-linux CFLAGS=-m32"
+#define GDB_TARGET_ARM_ON_X86_64  "GDB_CONF_FLAGS=--target=arm-elf-linux CFLAGS=-m32 CXXFLAGS=-m32"
+#define GDB_TARGET_X86_ON_X86_64  "GDB_CONF_FLAGS=--target=i686-pc-linux-gnu CFLAGS=-m32 CXXFLAGS=-m32"
+#define GDB_TARGET_PPC_ON_PPC64   "GDB_CONF_FLAGS=--target=ppc-elf-linux CFLAGS=-m32 CXXFLAGS=-m32"
 #define GDB_TARGET_ARM64_ON_X86_64  "GDB_CONF_FLAGS=--target=aarch64-elf-linux"   /* TBD */
 #define GDB_TARGET_PPC64_ON_X86_64  "GDB_CONF_FLAGS=--target=powerpc64le-unknown-linux-gnu"
 #define GDB_TARGET_MIPS_ON_X86     "GDB_CONF_FLAGS=--target=mipsel-elf-linux"
-#define GDB_TARGET_MIPS_ON_X86_64  "GDB_CONF_FLAGS=--target=mipsel-elf-linux CFLAGS=-m32"
+#define GDB_TARGET_MIPS_ON_X86_64  "GDB_CONF_FLAGS=--target=mipsel-elf-linux CFLAGS=-m32 CXXFLAGS=-m32"
      
 /*
  *  The original plan was to allow the use of a particular version
@@ -177,9 +182,10 @@ void add_extra_lib(char *);
 #define GDB_7_0   (3)
 #define GDB_7_3_1 (4)
 #define GDB_7_6   (5)
-#define SUPPORTED_GDB_VERSIONS (GDB_7_6 + 1)
+#define GDB_10_2   (6)
+#define SUPPORTED_GDB_VERSIONS (GDB_10_2 + 1)
 
-int default_gdb = GDB_7_6;
+int default_gdb = GDB_10_2;
 
 struct supported_gdb_version {
 	char *GDB;
@@ -244,6 +250,15 @@ struct supported_gdb_version {
 	    "GDB_FLAGS=-DGDB_7_6",
 	    "GPLv3"
 	},
+        {
+            "GDB=gdb-10.2",
+            "10.2",
+            "GDB_FILES=${GDB_10.2_FILES}",
+            "GDB_OFILES=${GDB_10.2_OFILES}",
+            "GDB_PATCH_FILES=gdb-10.2.patch",
+            "GDB_FLAGS=-DGDB_10_2",
+            "GPLv3"
+        },
 };
 
 #define DAEMON  0x1
@@ -380,7 +395,11 @@ get_current_configuration(struct supported_gdb_version *sp)
         target_data.target = ARM64;
 #endif
 #ifdef __mips__
-        target_data.target = MIPS;
+#ifndef __mips64
+	target_data.target = MIPS;
+#else
+	target_data.target = MIPS64;
+#endif
 #endif
 #ifdef __sparc_v9__
 	target_data.target = SPARC64;
@@ -473,6 +492,10 @@ get_current_configuration(struct supported_gdb_version *sp)
 			else
 				arch_mismatch(sp);
 		}
+
+		if ((target_data.initial_gdb_target == MIPS64) &&
+		    (target_data.target != MIPS64))
+			arch_mismatch(sp);
 
 		if ((target_data.initial_gdb_target == X86) &&
 		    (target_data.target != X86)) {
@@ -631,6 +654,9 @@ show_configuration(void)
 	case MIPS:
 		printf("TARGET: MIPS\n");
 		break;
+	case MIPS64:
+		printf("TARGET: MIPS64\n");
+		break;
 	case SPARC64:
 		printf("TARGET: SPARC64\n");
 		break;
@@ -742,7 +768,11 @@ build_configure(struct supported_gdb_version *sp)
 			gdb_conf_flags = GDB_TARGET_MIPS_ON_X86_64;
 		} else
                         target_CFLAGS = TARGET_CFLAGS_MIPS;
-                break;
+		break;
+	case MIPS64:
+		target = TARGET_MIPS64;
+		target_CFLAGS = TARGET_CFLAGS_MIPS64;
+		break;
 	case SPARC64:
 		target = TARGET_SPARC64;
 		target_CFLAGS = TARGET_CFLAGS_SPARC64;
@@ -1339,12 +1369,12 @@ make_spec_file(struct supported_gdb_version *sp)
 	printf("License: %s\n", sp->GPL);
 	printf("Group: Development/Debuggers\n");
 	printf("Source: %%{name}-%%{version}.tar.gz\n");
-	printf("URL: http://people.redhat.com/anderson\n");
+	printf("URL: https://github.com/crash-utility\n");
 	printf("Distribution: Linux 2.2 or greater\n");
 	printf("Vendor: Red Hat, Inc.\n");
 	printf("Packager: Dave Anderson <anderson@redhat.com>\n");
 	printf("ExclusiveOS: Linux\n");
-	printf("ExclusiveArch: %%{ix86} alpha ia64 ppc ppc64 ppc64pseries ppc64iseries x86_64 s390 s390x arm aarch64 ppc64le mips mipsel sparc64\n");
+	printf("ExclusiveArch: %%{ix86} alpha ia64 ppc ppc64 ppc64pseries ppc64iseries x86_64 s390 s390x arm aarch64 ppc64le mips mipsel mips64el sparc64\n");
 	printf("Buildroot: %%{_tmppath}/%%{name}-root\n");
 	printf("BuildRequires: ncurses-devel zlib-devel bison\n");
 	printf("Requires: binutils\n");
@@ -1494,6 +1524,12 @@ setup_gdb_defaults(void)
 			fprintf(stderr, ".gdb configuration: %s\n", sp->GDB_VERSION_IN);
 			return store_gdb_defaults(sp);
 		}
+                if (strcmp(buf, "10.2") == 0) {
+                        fclose(fp);
+                        sp = &supported_gdb_versions[GDB_10_2];
+                        fprintf(stderr, ".gdb configuration: %s\n", sp->GDB_VERSION_IN);
+                        return store_gdb_defaults(sp);
+                }
 
         }
 	
@@ -1571,6 +1607,8 @@ set_initial_target(struct supported_gdb_version *sp)
 		target_data.initial_gdb_target = ARM64;
 	else if (strncmp(buf, "ARM", strlen("ARM")) == 0)
 		target_data.initial_gdb_target = ARM;
+	else if (strncmp(buf, "MIPS64", strlen("MIPS64")) == 0)
+		target_data.initial_gdb_target = MIPS64;
 	else if (strncmp(buf, "MIPS", strlen("MIPS")) == 0)
 		target_data.initial_gdb_target = MIPS;
 	else if (strncmp(buf, "SPARC64", strlen("SPARC64")) == 0)
@@ -1593,6 +1631,7 @@ target_to_name(int target)
 	case ARM:    return("ARM"); 
 	case ARM64:  return("ARM64");
 	case MIPS:   return("MIPS");
+	case MIPS64: return("MIPS64");
 	case SPARC64: return("SPARC64");
 	}
 
@@ -1652,6 +1691,10 @@ name_to_target(char *name)
                 return MIPS;
         else if (strncmp(name, "MIPS", strlen("MIPS")) == 0)
                 return MIPS;
+	else if (strncmp(name, "mips64", strlen("mips64")) == 0)
+		return MIPS64;
+	else if (strncmp(name, "MIPS64", strlen("MIPS64")) == 0)
+		return MIPS64;
 	else if (strncmp(name, "sparc64", strlen("sparc64")) == 0)
 		return SPARC64;
 
@@ -1704,18 +1747,27 @@ get_extra_flags(char *filename, char *initial)
  *  a CFLAGS.extra file and an LDFLAGS.extra file.
 
  *  For lzo: 
+ *    - enter -DLZO in the CFLAGS.extra file
+ *    - enter -llzo2 in the LDFLAGS.extra file
+ *
+ *  For snappy:
  *    - enter -DSNAPPY in the CFLAGS.extra file
  *    - enter -lsnappy in the LDFLAGS.extra file
  *
- *  For snappy:
- *    - enter -DLZO in the CFLAGS.extra file
- *    - enter -llzo2 in the LDFLAGS.extra file.
+ *  For zstd:
+ *    - enter -DZSTD in the CFLAGS.extra file
+ *    - enter -lzstd in the LDFLAGS.extra file
+ *
+ *  For valgrind:
+ *    - enter -DVALGRIND in the CFLAGS.extra file
  */
 void
 add_extra_lib(char *option)
 {
 	int lzo, add_DLZO, add_llzo2; 
 	int snappy, add_DSNAPPY, add_lsnappy;
+	int zstd, add_DZSTD, add_lzstd;
+	int valgrind, add_DVALGRIND;
 	char *cflags, *ldflags;
 	FILE *fp_cflags, *fp_ldflags;
 	char *mode;
@@ -1723,6 +1775,8 @@ add_extra_lib(char *option)
 
 	lzo = add_DLZO = add_llzo2 = 0;
 	snappy = add_DSNAPPY = add_lsnappy = 0;
+	zstd = add_DZSTD = add_lzstd = 0;
+	valgrind = add_DVALGRIND = 0;
 
 	ldflags = get_extra_flags("LDFLAGS.extra", NULL);
 	cflags = get_extra_flags("CFLAGS.extra", NULL);
@@ -1743,11 +1797,31 @@ add_extra_lib(char *option)
 			add_lsnappy++;
 	}
 
-	if ((lzo || snappy) &&
+	if (strcmp(option, "zstd") == 0) {
+		zstd++;
+		if (!cflags || !strstr(cflags, "-DZSTD"))
+			add_DZSTD++;
+		if (!ldflags || !strstr(ldflags, "-lzstd"))
+			add_lzstd++;
+	}
+
+	if (strcmp(option, "valgrind") == 0) {
+		valgrind++;
+		if (!cflags || !strstr(cflags, "-DVALGRIND"))
+			add_DVALGRIND++;
+	}
+
+	if ((lzo || snappy || zstd) &&
 	    file_exists("diskdump.o") && (unlink("diskdump.o") < 0)) {
 		perror("diskdump.o");
 		return;
 	} 
+
+	if (valgrind &&
+	    file_exists("tools.o") && (unlink("tools.o") < 0)) {
+		perror("tools.o");
+		return;
+	}
 
 	mode = file_exists("CFLAGS.extra") ? "r+" : "w+";
 	if ((fp_cflags = fopen("CFLAGS.extra", mode)) == NULL) {
@@ -1762,22 +1836,28 @@ add_extra_lib(char *option)
 		return;
 	}
 
-	if (add_DLZO || add_DSNAPPY) {
+	if (add_DLZO || add_DSNAPPY || add_DZSTD || add_DVALGRIND) {
 		while (fgets(inbuf, 512, fp_cflags))
 			;
 		if (add_DLZO)
 			fputs("-DLZO\n", fp_cflags);
 		if (add_DSNAPPY)
 			fputs("-DSNAPPY\n", fp_cflags);
+		if (add_DZSTD)
+			fputs("-DZSTD\n", fp_cflags);
+		if (add_DVALGRIND)
+			fputs("-DVALGRIND\n", fp_cflags);
 	}
 
-	if (add_llzo2 || add_lsnappy) {
+	if (add_llzo2 || add_lsnappy || add_lzstd) {
 		while (fgets(inbuf, 512, fp_ldflags))
 			;
 		if (add_llzo2)
 			fputs("-llzo2\n", fp_ldflags);
 		if (add_lsnappy)
 			fputs("-lsnappy\n", fp_ldflags);
+		if (add_lzstd)
+			fputs("-lzstd\n", fp_ldflags);
 	}
 
 	fclose(fp_cflags);

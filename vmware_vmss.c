@@ -1,7 +1,7 @@
 /*
  * vmware_vmss.c
  *
- * Copyright (c) 2015 VMware, Inc.
+ * Copyright (c) 2015, 2020 VMware, Inc.
  * Copyright (c) 2018 Red Hat Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -16,6 +16,7 @@
  *
  * Authors: Dyno Hongjun Fu <hfu@vmware.com>
  *          Sergio Lopez <slp@redhat.com>
+ *          Alexey Makhalov <amakhalov@vmware.com>
  */
 
 #include "defs.h"
@@ -23,13 +24,7 @@
 
 #define LOGPRX "vmw: "
 
-/* VMware only supports X86/X86_64 virtual machines. */
-#define VMW_PAGE_SIZE (4096)
-#define VMW_PAGE_SHIFT (12)
-
-#define MAX_BLOCK_DUMP (128)
-
-static vmssdata vmss = { 0 };
+vmssdata vmss = { 0 };
 
 int
 is_vmware_vmss(char *filename)
@@ -175,8 +170,10 @@ vmware_vmss_init(char *filename, FILE *ofp)
 				}
 				DEBUG_PARSE_PRINT((ofp, "[%d]", idx[j]));
 			}
-		       if (nextgroup)
+			if (nextgroup) {
+				DEBUG_PARSE_PRINT((ofp, "\n"));
 				break;
+			}
 
 			if (IS_BLOCK_TAG(tag)) {
 				uint64_t nbytes;
@@ -232,16 +229,22 @@ vmware_vmss_init(char *filename, FILE *ofp)
 						      filename, errno, strerror(errno));
 						break;
 					}
+					DEBUG_PARSE_PRINT((ofp, "\n"));
 					vmss.vcpu_regs[cpu] |= REGS_PRESENT_GPREGS;
 				} else if (strcmp(name, "CR64") == 0 &&
 					   nbytes == VMW_CR64_SIZE &&
 					   idx[0] < vmss.num_vcpus) {
 					int cpu = idx[0];
+					DEBUG_PARSE_PRINT((ofp, "\t=> "));
 					if (fread(&vmss.regs64[cpu]->cr[0], VMW_CR64_SIZE, 1, fp) != 1) {
 						error(INFO, LOGPRX"Failed to read '%s': [Error %d] %s\n",
 						      filename, errno, strerror(errno));
 						break;
 					}
+					for (j = 0; j < VMW_CR64_SIZE / 8; j++)
+						DEBUG_PARSE_PRINT((ofp, "%s%016llX", j ? " " : "",
+								(ulonglong)vmss.regs64[cpu]->cr[j]));
+					DEBUG_PARSE_PRINT((ofp, "\n"));
 					vmss.vcpu_regs[cpu] |= REGS_PRESENT_CRS;
 				} else if (strcmp(name, "IDTR") == 0 &&
 					   nbytes == VMW_IDTR_SIZE &&
@@ -258,6 +261,7 @@ vmware_vmss_init(char *filename, FILE *ofp)
 						      filename, errno, strerror(errno));
 						break;
 					}
+					DEBUG_PARSE_PRINT((ofp, "\n"));
 					vmss.regs64[cpu]->idtr = idtr;
 					vmss.vcpu_regs[cpu] |= REGS_PRESENT_IDTR;
 				} else {
@@ -266,6 +270,7 @@ vmware_vmss_init(char *filename, FILE *ofp)
 						      (ulonglong)(blockpos + nbytes));
 						break;
 					}
+					DEBUG_PARSE_PRINT((ofp, "\n"));
 				}
 			} else {
 				union {
@@ -439,11 +444,13 @@ vmware_vmss_init(char *filename, FILE *ofp)
 	if (vmss.memsize == 0) {
 		char *vmem_filename, *p;
 
-		fprintf(ofp, LOGPRX"Memory dump is not part of this vmss file.\n");
+		if (!(pc->flags & SILENT))
+			fprintf(ofp, LOGPRX"Memory dump is not part of this vmss file.\n");
 		fclose(fp);
 		fp = NULL;
 
-		fprintf(ofp, LOGPRX"Try to locate the companion vmem file ...\n");
+		if (!(pc->flags & SILENT))
+			fprintf(ofp, LOGPRX"Try to locate the companion vmem file ...\n");
 		/* check the companion vmem file */
 		vmem_filename = strdup(filename);
 		p = vmem_filename + strlen(vmem_filename) - 4;
@@ -466,7 +473,8 @@ vmware_vmss_init(char *filename, FILE *ofp)
 		vmss.separate_vmem = TRUE;
 		vmss.filename = filename;
 
-		fprintf(ofp, LOGPRX"vmem file: %s\n\n", vmem_filename);
+		if (!(pc->flags & SILENT))
+			fprintf(ofp, LOGPRX"vmem file: %s\n\n", vmem_filename);
 		free(vmem_filename);
 	}
 
@@ -498,12 +506,14 @@ read_vmware_vmss(int fd, void *bufptr, int cnt, ulong addr, physaddr_t paddr)
 	        int i;
 
 		for (i = 0; i < vmss.regionscount; i++) {
+			uint32_t hole;
+
 			if (ppn < vmss.regions[i].startppn)
 				break;
 
 			/* skip holes. */
-			pos -= ((vmss.regions[i].startppn - vmss.regions[i].startpagenum)
-				<< VMW_PAGE_SHIFT);
+			hole = vmss.regions[i].startppn - vmss.regions[i].startpagenum;
+			pos -= (uint64_t)hole << VMW_PAGE_SHIFT;
 		}
 	}
 
@@ -867,15 +877,70 @@ vmware_vmss_valid_regs(struct bt_info *bt)
 }
 
 int
-vmware_vmss_get_cr3_idtr(ulong *cr3, ulong *idtr)
+vmware_vmss_get_nr_cpus(void)
 {
-	if (vmss.num_vcpus == 0 || vmss.vcpu_regs[0] != REGS_PRESENT_ALL)
+	return vmss.num_vcpus;
+}
+
+int
+vmware_vmss_get_cr3_cr4_idtr(int cpu, ulong *cr3, ulong *cr4, ulong *idtr)
+{
+	if (cpu >= vmss.num_vcpus || vmss.vcpu_regs[cpu] != REGS_PRESENT_ALL)
 		return FALSE;
 
-	*cr3 = vmss.regs64[0]->cr[3];
-	*idtr = vmss.regs64[0]->idtr;
+	*cr3 = vmss.regs64[cpu]->cr[3];
+	*cr4 = vmss.regs64[cpu]->cr[4];
+	*idtr = vmss.regs64[cpu]->idtr;
 
 	return TRUE;
+}
+
+int
+vmware_vmss_get_cpu_reg(int cpu, int regno, const char *name, int size,
+                        void *value)
+{
+        if (cpu >= vmss.num_vcpus)
+                return FALSE;
+
+        /* All supported registers are 8 bytes long. */
+        if (size != 8)
+                return FALSE;
+
+#define CASE(R,r) \
+                case R##_REGNUM: \
+                        if (!(vmss.vcpu_regs[cpu] & REGS_PRESENT_##R)) \
+                                return FALSE; \
+                        memcpy(value, &vmss.regs64[cpu]->r, size); \
+                        break
+
+
+        switch (regno) {
+                CASE (RAX, rax);
+                CASE (RBX, rbx);
+                CASE (RCX, rcx);
+                CASE (RDX, rdx);
+                CASE (RSI, rsi);
+                CASE (RDI, rdi);
+                CASE (RBP, rbp);
+                CASE (RSP, rsp);
+                CASE (R8, r8);
+                CASE (R9, r9);
+                CASE (R10, r10);
+                CASE (R11, r11);
+                CASE (R12, r12);
+                CASE (R13, r13);
+                CASE (R14, r14);
+                CASE (R15, r15);
+                CASE (RIP, rip);
+                case EFLAGS_REGNUM:
+                        if (!(vmss.vcpu_regs[cpu] & REGS_PRESENT_RFLAGS))
+                                return FALSE;
+                        memcpy(value, &vmss.regs64[cpu]->rflags, size);
+                        break;
+                default:
+                        return FALSE;
+        }
+        return TRUE;
 }
 
 int

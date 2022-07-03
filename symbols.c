@@ -1,8 +1,8 @@
 /* symbols.c - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002-2019 David Anderson
- * Copyright (C) 2002-2019 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2020 David Anderson
+ * Copyright (C) 2002-2020 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -17,7 +17,7 @@
 
 #include "defs.h"
 #include <elf.h>
-#ifdef GDB_7_6
+#if defined(GDB_7_6) || defined(GDB_10_2)
 #define __CONFIG_H__ 1
 #include "config.h"
 #endif
@@ -34,7 +34,7 @@ static int compare_mods(const void *, const void *);
 static int compare_prios(const void *v1, const void *v2);
 static int compare_size_name(const void *, const void *);
 struct type_request;
-static void append_struct_symbol (struct type_request *, struct gnu_request *);
+static void append_struct_symbol (struct gnu_request *, void *);
 static void request_types(ulong, ulong, char *);
 static asection *get_kernel_section(char *);
 static char * get_section(ulong vaddr, char *buf);
@@ -65,7 +65,7 @@ static void symval_hash_init(void);
 static struct syment *symval_hash_search(ulong);
 static void symname_hash_init(void);
 static void symname_hash_install(struct syment *);
-static struct syment *symname_hash_search(char *);
+static struct syment *symname_hash_search(struct syment *[], char *);
 static void gnu_qsort(bfd *, void *, long, unsigned int, asymbol *, asymbol *);
 static int check_gnu_debuglink(bfd *);
 static int separate_debug_file_exists(const char *, unsigned long, int *);
@@ -145,6 +145,7 @@ static void print_union(char *, ulong);
 static void dump_datatype_member(FILE *, struct datatype_member *);
 static void dump_datatype_flags(ulong, FILE *);
 static long anon_member_offset(char *, char *);
+static long anon_member_size(char *, char *);
 static int gdb_whatis(char *);
 static void do_datatype_declaration(struct datatype_member *, ulong);
 static int member_to_datatype(char *, struct datatype_member *, ulong);
@@ -277,7 +278,7 @@ check_gnu_debuglink(bfd *bfd)
 		return FALSE;
 	}
 
-	debuglink_size = bfd_section_size(bfd, sect);
+	debuglink_size = bfd_section_size(sect);
 
 	contents = GETBUF(debuglink_size);
 
@@ -442,7 +443,7 @@ separate_debug_file_exists(const char *name, unsigned long crc, int *exists)
 #ifdef GDB_5_3
     		file_crc = calc_crc32(file_crc, buffer, count);
 #else
-#ifdef GDB_7_6
+#if defined(GDB_7_6) || defined(GDB_10_2)
     		file_crc = bfd_calc_gnu_debuglink_crc32(file_crc, 
 			(unsigned char *)buffer, count);
 #else
@@ -523,9 +524,9 @@ get_text_init_space(void)
 		return;
 	}
 
-        kt->stext_init = (ulong)bfd_get_section_vma(st->bfd, section);
+        kt->stext_init = (ulong)bfd_section_vma(section);
         kt->etext_init = kt->stext_init +
-        	(ulong)bfd_section_size(st->bfd, section);
+		(ulong)bfd_section_size(section);
 
 	if (kt->relocate) {
 		kt->stext_init -= kt->relocate;
@@ -539,30 +540,28 @@ get_text_init_space(void)
 static char *
 strip_symbol_end(const char *name, char *buf)
 {
+	int i;
 	char *p;
+	char *strip[] = {
+		".isra.",
+		".part.",
+		".llvm.",
+		NULL
+	};
 
 	if (st->flags & NO_STRIP)
 		return (char *)name;
 
-	if ((p = strstr(name, ".isra."))) {
-		if (buf) {
-			strcpy(buf, name);
-			buf[p-name] = NULLCHAR;
-			return buf;
-		} else {
-			*p = NULLCHAR;
-			return (char *)name;
-		}
-	}
-
-	if ((p = strstr(name, ".part."))) {
-		if (buf) {
-			strcpy(buf, name);
-			buf[p-name] = NULLCHAR;
-			return buf;
-		} else {
-			*p = NULLCHAR;
-			return (char *)name;
+	for (i = 0; strip[i]; i++) {
+		if ((p = strstr(name, strip[i]))) {
+			if (buf) {
+				strcpy(buf, name);
+				buf[p-name] = NULLCHAR;
+				return buf;
+			} else {
+				*p = NULLCHAR;
+				return (char *)name;
+			}
 		}
 	}
 
@@ -597,6 +596,12 @@ kaslr_init(void)
 	    !machine_type("S390X")) || (kt->flags & RELOC_SET))
 		return;
 
+	if (!kt->vmcoreinfo._stext_SYMBOL &&
+	    (string = pc->read_vmcoreinfo("SYMBOL(_stext)"))) {
+		kt->vmcoreinfo._stext_SYMBOL = htol(string, RETURN_ON_ERROR, NULL);
+		free(string);
+	}
+
 	/*
 	 *  --kaslr=auto
 	 */
@@ -609,8 +614,7 @@ kaslr_init(void)
 		st->_stext_vmlinux = UNINITIALIZED;
 	}
 
-	if (machine_type("S390X") &&  /* Linux 5.2 */
-	    (symbol_value_from_proc_kallsyms("__kaslr_offset") != BADVAL)) {
+	if (machine_type("S390X")) {
 		kt->flags2 |= (RELOC_AUTO|KASLR);
 		st->_stext_vmlinux = UNINITIALIZED;
 	}
@@ -622,12 +626,6 @@ kaslr_init(void)
 			kt->flags2 |= KASLR_CHECK;
 		}
 	} else if (KDUMP_DUMPFILE() || DISKDUMP_DUMPFILE()) {
-		if ((string = pc->read_vmcoreinfo("SYMBOL(_stext)"))) {
-			kt->vmcoreinfo._stext_SYMBOL =
-				htol(string, RETURN_ON_ERROR, NULL);
-			free(string);
-		}
-
 		/* Linux 3.14 */
 		if ((string = pc->read_vmcoreinfo("KERNELOFFSET"))) {
 			free(string);
@@ -636,8 +634,11 @@ kaslr_init(void)
 		}
 	}
 
-	if (SADUMP_DUMPFILE() || VMSS_DUMPFILE())
+	if (SADUMP_DUMPFILE() || QEMU_MEM_DUMP_NO_VMCOREINFO() || VMSS_DUMPFILE()) {
+		/* Need for kaslr_offset and phys_base */
 		kt->flags2 |= KASLR_CHECK;
+		st->_stext_vmlinux = UNINITIALIZED;
+	}
 }
 
 /*
@@ -1126,6 +1127,21 @@ symname_hash_init(void)
 		st->__per_cpu_end = sp->value;
 }
 
+static unsigned int
+symname_hash_index(char *name)
+{
+	unsigned int len, value;
+	unsigned char *array = (unsigned char *)name;
+
+	len = strlen(name);
+	if (!len)
+		error(FATAL, "The length of the symbol name is zero!\n");
+
+	value = array[len - 1] * array[len / 2];
+
+	return (array[0] ^ value) % SYMNAME_HASH;
+}
+
 /*
  *  Install a single static kernel symbol into the symname_hash.
  */
@@ -1133,9 +1149,9 @@ static void
 symname_hash_install(struct syment *spn)
 {
 	struct syment *sp;
-        int index;
+	unsigned int index;
 
-        index = SYMNAME_HASH_INDEX(spn->name);
+	index = symname_hash_index(spn->name);
 	spn->cnt = 1;
 
         if ((sp = st->symname_hash[index]) == NULL) 
@@ -1157,14 +1173,87 @@ symname_hash_install(struct syment *spn)
 }
 
 /*
- *  Static kernel symbol value search
+ *  Install a single kernel module symbol into the mod_symname_hash.
  */
-static struct syment *
-symname_hash_search(char *name)
+static void
+mod_symname_hash_install(struct syment *spn)
+{
+	struct syment *sp;
+	unsigned int index;
+
+	if (!spn)
+		return;
+
+	index = symname_hash_index(spn->name);
+
+	sp = st->mod_symname_hash[index];
+
+	if (!sp || (spn->value < sp->value)) {
+		st->mod_symname_hash[index] = spn;
+		spn->name_hash_next = sp;
+		return;
+	}
+	for (; sp; sp = sp->name_hash_next) {
+		if (!sp->name_hash_next ||
+		    spn->value < sp->name_hash_next->value) {
+			spn->name_hash_next = sp->name_hash_next;
+			sp->name_hash_next = spn;
+			return;
+		}
+	}
+}
+
+static void
+mod_symname_hash_remove(struct syment *spn)
+{
+	struct syment *sp;
+	unsigned int index;
+
+	if (!spn)
+		return;
+
+	index = symname_hash_index(spn->name);
+
+	if (st->mod_symname_hash[index] == spn) {
+		st->mod_symname_hash[index] = spn->name_hash_next;
+		return;
+	}
+
+	for (sp = st->mod_symname_hash[index]; sp; sp = sp->name_hash_next) {
+		if (sp->name_hash_next == spn) {
+			sp->name_hash_next = spn->name_hash_next;
+			return;
+		}
+	}
+}
+
+static void
+mod_symtable_hash_install_range(struct syment *from, struct syment *to)
 {
 	struct syment *sp;
 
-        sp = st->symname_hash[SYMNAME_HASH_INDEX(name)];
+	for (sp = from; sp <= to; sp++)
+		mod_symname_hash_install(sp);
+}
+
+static void
+mod_symtable_hash_remove_range(struct syment *from, struct syment *to)
+{
+	struct syment *sp;
+
+	for (sp = from; sp <= to; sp++)
+		mod_symname_hash_remove(sp);
+}
+
+/*
+ *  Static kernel symbol value search
+ */
+static struct syment *
+symname_hash_search(struct syment *table[], char *name)
+{
+	struct syment *sp;
+
+	sp = table[symname_hash_index(name)];
 
 	while (sp) {
 		if (STREQ(sp->name, name)) 
@@ -1594,6 +1683,7 @@ store_module_symbols_v1(ulong total, int mods_installed)
 				lm->mod_symend = sp;
 			}
 		}
+		mod_symtable_hash_install_range(lm->mod_symtable, lm->mod_symend);
 	}
 
 	st->flags |= MODULE_SYMS;
@@ -1607,39 +1697,100 @@ union kernel_symbol {
 		unsigned long value;
 		const char *name;
 	} v1;
-	/* kernel 4.19 introduced relative symbol positionning */
+	/* kernel 4.19 introduced relative symbol positioning */
 	struct kernel_symbol_v2 {
 		int value_offset;
 		int name_offset;
 	} v2;
+	/* kernel 5.4 introduced symbol namespaces */
+	struct kernel_symbol_v3 {
+		int value_offset;
+		int name_offset;
+		int namespace_offset;
+	} v3;
+	struct kernel_symbol_v4 {
+		unsigned long value;
+		const char *name;
+		const char *namespace;
+	} v4;
 };
+
+static size_t
+kernel_symbol_type_init(void)
+{
+	if (MEMBER_EXISTS("kernel_symbol", "value") &&
+	    MEMBER_EXISTS("kernel_symbol", "name")) {
+		if (MEMBER_EXISTS("kernel_symbol", "namespace")) {
+			st->kernel_symbol_type = 4;
+			return (sizeof(struct kernel_symbol_v4));
+		} else {
+			st->kernel_symbol_type = 1;
+			return (sizeof(struct kernel_symbol_v1));
+		}
+	}
+	if (MEMBER_EXISTS("kernel_symbol", "value_offset") &&
+	    MEMBER_EXISTS("kernel_symbol", "name_offset")) {
+		if (MEMBER_EXISTS("kernel_symbol", "namespace_offset")) {
+			st->kernel_symbol_type = 3;
+			return (sizeof(struct kernel_symbol_v3));
+		} else {
+			st->kernel_symbol_type = 2;
+			return (sizeof(struct kernel_symbol_v2));
+		}
+	}
+
+	error(FATAL, "kernel_symbol data structure has changed\n");
+
+	return 0;
+}
 
 static ulong
 modsym_name(ulong syms, union kernel_symbol *modsym, int i)
 {
-	if (VALID_MEMBER(kernel_symbol_value))
+	switch (st->kernel_symbol_type)
+	{
+	case 1:
 		return (ulong)modsym->v1.name;
+	case 2:
+		return (syms + i * sizeof(struct kernel_symbol_v2) +
+			offsetof(struct kernel_symbol_v2, name_offset) +
+			modsym->v2.name_offset);
+	case 3:
+		return (syms + i * sizeof(struct kernel_symbol_v3) +
+			offsetof(struct kernel_symbol_v3, name_offset) +
+			modsym->v3.name_offset);
+	case 4:
+		return (ulong)modsym->v4.name;
+	}
 
-	return syms + i * sizeof(struct kernel_symbol_v2) +
-		offsetof(struct kernel_symbol_v2, name_offset) +
-		modsym->v2.name_offset;
+	return 0;
 }
 
 static ulong
 modsym_value(ulong syms, union kernel_symbol *modsym, int i)
 {
-	if (VALID_MEMBER(kernel_symbol_value))
+	switch (st->kernel_symbol_type)
+	{
+	case 1:
 		return (ulong)modsym->v1.value;
+	case 2:
+		return (syms + i * sizeof(struct kernel_symbol_v2) +
+			offsetof(struct kernel_symbol_v2, value_offset) +
+			modsym->v2.value_offset);
+	case 3:
+		return (syms + i * sizeof(struct kernel_symbol_v3) +
+			offsetof(struct kernel_symbol_v3, value_offset) +
+			modsym->v3.value_offset);
+	case 4:
+		return (ulong)modsym->v4.value;
+	}
 
-	return syms + i * sizeof(struct kernel_symbol_v2) +
-		offsetof(struct kernel_symbol_v2, value_offset) +
-		modsym->v2.value_offset;
+	return 0;
 }
 
 void
 store_module_symbols_v2(ulong total, int mods_installed)
 {
-
         int i, m;
         ulong mod, mod_next; 
 	char *mod_name;
@@ -1675,12 +1826,7 @@ store_module_symbols_v2(ulong total, int mods_installed)
 		  "re-initialization of module symbols not implemented yet!\n");
 	}
 
-	MEMBER_OFFSET_INIT(kernel_symbol_value, "kernel_symbol", "value");
-	if (VALID_MEMBER(kernel_symbol_value)) {
-		kernel_symbol_size = sizeof(struct kernel_symbol_v1);
-	} else {
-		kernel_symbol_size = sizeof(struct kernel_symbol_v2);
-	}
+	kernel_symbol_size = kernel_symbol_type_init();
 
         if ((st->ext_module_symtable = (struct syment *)
              calloc(total, sizeof(struct syment))) == NULL)
@@ -1712,17 +1858,17 @@ store_module_symbols_v2(ulong total, int mods_installed)
 
 		if (THIS_KERNEL_VERSION >= LINUX(2,6,27)) {
 			nksyms = UINT(modbuf + OFFSET(module_num_symtab));
-			size = UINT(modbuf + OFFSET(module_core_size));
+			size = UINT(modbuf + MODULE_OFFSET2(module_core_size, rx));
 		} else {
 			nksyms = ULONG(modbuf + OFFSET(module_num_symtab));
-			size = ULONG(modbuf + OFFSET(module_core_size));
+			size = ULONG(modbuf + MODULE_OFFSET2(module_core_size, rx));
 		}
 
 		mod_name = modbuf + OFFSET(module_name);
 
 		lm = &st->load_modules[m++];
 		BZERO(lm, sizeof(struct load_module));
-		lm->mod_base = ULONG(modbuf + OFFSET(module_module_core));
+		lm->mod_base = ULONG(modbuf + MODULE_OFFSET2(module_module_core, rx));
 		lm->module_struct = mod;
 		lm->mod_size = size;
         	if (strlen(mod_name) < MAX_MOD_NAME)
@@ -1741,23 +1887,23 @@ store_module_symbols_v2(ulong total, int mods_installed)
 		lm->mod_flags = MOD_EXT_SYMS;
 		lm->mod_ext_symcnt = mcnt;
 		lm->mod_init_module_ptr = ULONG(modbuf + 
-			OFFSET(module_module_init));
+			MODULE_OFFSET2(module_module_init, rx));
 		if (VALID_MEMBER(module_percpu))
 			lm->mod_percpu = ULONG(modbuf + OFFSET(module_percpu));
 		if (THIS_KERNEL_VERSION >= LINUX(2,6,27)) {
 			lm->mod_etext_guess = lm->mod_base +
-				UINT(modbuf + OFFSET(module_core_text_size));
+				UINT(modbuf + MODULE_OFFSET(module_core_text_size, module_core_size_rx));
 			lm->mod_init_size =
-				UINT(modbuf + OFFSET(module_init_size));
+				UINT(modbuf + MODULE_OFFSET2(module_init_size, rx));
 			lm->mod_init_text_size = 
-				UINT(modbuf + OFFSET(module_init_text_size));
+				UINT(modbuf + MODULE_OFFSET(module_init_text_size, module_init_size_rx));
 		} else {
 			lm->mod_etext_guess = lm->mod_base +
-				ULONG(modbuf + OFFSET(module_core_text_size));
+				ULONG(modbuf + MODULE_OFFSET(module_core_text_size, module_core_size_rx));
 			lm->mod_init_size =
-				ULONG(modbuf + OFFSET(module_init_size));
+				ULONG(modbuf + MODULE_OFFSET2(module_init_size, rx));
 			lm->mod_init_text_size = 
-				ULONG(modbuf + OFFSET(module_init_text_size));
+				ULONG(modbuf + MODULE_OFFSET(module_init_text_size, module_init_size_rx));
 		}
 		lm->mod_text_start = lm->mod_base;
 
@@ -2018,6 +2164,8 @@ store_module_symbols_v2(ulong total, int mods_installed)
 				lm->mod_init_symend = sp;
 			}
 		}
+		mod_symtable_hash_install_range(lm->mod_symtable, lm->mod_symend);
+		mod_symtable_hash_install_range(lm->mod_init_symtable, lm->mod_init_symend);
 	}
 
 	st->flags |= MODULE_SYMS;
@@ -2807,10 +2955,8 @@ is_kernel_text(ulong value)
 	        for (i = 0; i < st->bfd->section_count; i++, sec++) {
 			section = *sec;
 	                if (section->flags & SEC_CODE) {
-				start = (ulong)bfd_get_section_vma(st->bfd, 
-					section);
-				end = start + (ulong)bfd_section_size(st->bfd, 
-					section);
+				start = (ulong)bfd_section_vma(section);
+				end = start + (ulong)bfd_section_size(section);
 
 				if (kt->flags2 & KASLR) {
 					start += (kt->relocate * -1);
@@ -3073,13 +3219,40 @@ kallsyms_module_function_size(struct syment *sp, struct load_module *lm, ulong *
 	return FALSE;
 }
 
+static void
+dump_symname_hash_table(struct syment *table[])
+{
+	int i, cnt, tot;
+	struct syment *sp;
+
+	fprintf(fp, "    ");
+	for (i = tot = 0; i < SYMNAME_HASH; i++) {
+		fprintf(fp, "[%3d]: ", i);
+		if ((sp = table[i]) == NULL)
+			fprintf(fp, "%3d  ", 0);
+		else {
+			cnt = 1;
+			while (sp->name_hash_next) {
+				cnt++;
+				sp = sp->name_hash_next;
+			}
+			fprintf(fp, "%3d  ", cnt);
+			tot += cnt;
+		}
+		if (i && (((i+1) % 6) == 0))
+			fprintf(fp, "\n    ");
+	}
+	if (SYMNAME_HASH % 6)
+		fprintf(fp, "\n");
+}
+
 /*
  *  "help -s" output
  */
 void
 dump_symbol_table(void)
 {
-	int i, s, cnt, tot;
+	int i, s, cnt;
         struct load_module *lm;
 	struct syment *sp;
 	struct downsized *ds;
@@ -3172,6 +3345,11 @@ dump_symbol_table(void)
 		fprintf(fp, " kaiser_init_vmlinux: (unused)\n");
 	}
 
+	if (SADUMP_DUMPFILE())
+		fprintf(fp, "linux_banner_vmlinux: %lx\n", st->linux_banner_vmlinux);
+	else
+		fprintf(fp, "linux_banner_vmlinux: (unused)\n");
+
         fprintf(fp, "    symval_hash[%d]: %lx\n", SYMVAL_HASH,
                 (ulong)&st->symval_hash[0]);
 
@@ -3204,28 +3382,14 @@ dump_symbol_table(void)
 
         fprintf(fp, "   symname_hash[%d]: %lx\n", SYMNAME_HASH,
                 (ulong)&st->symname_hash[0]);
+	if (CRASHDEBUG(1))
+		dump_symname_hash_table(st->symname_hash);
 
-	if (CRASHDEBUG(1)) {
-		fprintf(fp, "    ");
-	        for (i = tot = 0; i < SYMNAME_HASH; i++) {
-	                fprintf(fp, "[%3d]: ", i);
-	                if ((sp = st->symname_hash[i]) == NULL) 
-	                        fprintf(fp, "%3d  ", 0);
-	                else {
-		                cnt = 1;
-		                while (sp->name_hash_next) {
-		                        cnt++;
-		                        sp = sp->name_hash_next;
-		                }
-		                fprintf(fp, "%3d  ", cnt);
-				tot += cnt;
-			}
-			if (i && (((i+1) % 6) == 0))
-				fprintf(fp, "\n    ");
-	        }
-		if (SYMNAME_HASH % 6)
-			fprintf(fp, "\n");
-	}
+	fprintf(fp, "mod_symname_hash[%d]: %lx\n", SYMNAME_HASH,
+		(ulong)&st->mod_symname_hash[0]);
+	if (CRASHDEBUG(1))
+		dump_symname_hash_table(st->mod_symname_hash);
+
 	fprintf(fp, "    symbol_namespace: ");
 	fprintf(fp, "address: %lx  ", (ulong)st->kernel_namespace.address);
 	fprintf(fp, "index: %ld  ", st->kernel_namespace.index); 
@@ -3408,8 +3572,8 @@ dump_symbol_table(void)
 		section = *sec;
 		fprintf(fp, "%25s  vma: %.*lx  size: %ld\n", 
 			section->name, VADDR_PRLEN,
-			(ulong)bfd_get_section_vma(st->bfd, section),
-			(ulong)bfd_section_size(st->bfd, section));
+			(ulong)bfd_section_vma(section),
+			(ulong)bfd_section_size(section));
 	}
 	fprintf(fp, "\n           downsized: ");
 	if (st->downsized.name) {
@@ -3418,6 +3582,8 @@ dump_symbol_table(void)
 		fprintf(fp, "\n");
 	} else
 		fprintf(fp, "(none)\n");
+
+	fprintf(fp, "  kernel_symbol_type: v%d\n", st->kernel_symbol_type);
 }
 
 
@@ -3572,6 +3738,11 @@ is_kernel(char *file)
 				goto bailout;
 			break;
 
+		case EM_MIPS:
+			if (machine_type_mismatch(file, "MIPS64", NULL, 0))
+				goto bailout;
+			break;
+
 		default:
 			if (machine_type_mismatch(file, "(unknown)", NULL, 0))
 				goto bailout;
@@ -3597,6 +3768,7 @@ is_compressed_kernel(char *file, char **tmp)
 
 #define GZIP  (1)
 #define BZIP2 (2)
+#define XZ    (3)
 
 #define FNAME (1 << 3)
 
@@ -3646,6 +3818,19 @@ is_compressed_kernel(char *file, char **tmp)
 		type = BZIP2;
 	}
 
+	if (!memcmp(header, "\xfd""7zXZ", 6)) {
+		if (!STRNEQ(basename(file), "vmlinux") &&
+		    !(st->flags & FORCE_DEBUGINFO)) {
+			error(INFO, "%s: compressed file name does not start "
+			    "with \"vmlinux\"\n", file);
+			error(CONT, 
+			    "Use \"-f %s\" on command line to override.\n\n",
+				file);
+			return FALSE;
+		}
+		type = XZ;
+	}
+
 	if (!type)
 		return FALSE;
 
@@ -3679,6 +3864,12 @@ is_compressed_kernel(char *file, char **tmp)
 		sprintf(command, "%s -c %s > %s", 
 			file_exists("/bin/bunzip2", NULL) ?
 			"/bin/bunzip2" : "/usr/bin/bunzip2",
+			file, tempname);
+		break;
+	case XZ:
+		sprintf(command, "%s -c %s > %s", 
+			file_exists("/bin/unxz", NULL) ?
+			"/bin/unxz" : "/usr/bin/unxz",
 			file, tempname);
 		break;
 	}
@@ -3787,7 +3978,8 @@ is_shared_object(char *file)
 			break;
 
 		case EM_X86_64:
-			if (machine_type("X86_64") || machine_type("ARM64")) 
+			if (machine_type("X86_64") || machine_type("ARM64") ||
+			    machine_type("PPC64"))
 				return TRUE;
 			break;
 
@@ -3803,6 +3995,11 @@ is_shared_object(char *file)
 
 		case EM_SPARCV9:
 			if (machine_type("SPARC64"))
+				return TRUE;
+			break;
+
+		case EM_MIPS:
+			if (machine_type("MIPS64"))
 				return TRUE;
 			break;
 		}
@@ -4203,8 +4400,7 @@ get_line_number(ulong addr, char *buf, int reserved)
 	if (module_symbol(addr, NULL, &lm, NULL, 0)) {
 		if (!(lm->mod_flags & MOD_LOAD_SYMS))
 			return(buf);
-	} else if (kt->flags2 & KASLR)
-		addr -= (kt->relocate * -1);
+	}
 
 	if ((lnh = machdep->line_number_hooks)) {
         	name = closest_symbol(addr);
@@ -4268,12 +4464,11 @@ get_section(ulong vaddr, char *buf)
 	        sec = (asection **)st->sections;
 	        for (i = 0; i < st->bfd->section_count; i++, sec++) {
 			section = *sec;
-	                start = (ulong)bfd_get_section_vma(st->bfd, section);
-	                end = start + (ulong)bfd_section_size(st->bfd, section);
+	                start = (ulong)bfd_section_vma(section);
+	                end = start + (ulong)bfd_section_size(section);
 	
 	                if ((vaddr >= start) && (vaddr < end)) {
-				strcpy(buf, bfd_get_section_name(st->bfd, 
-					section));
+				strcpy(buf, bfd_section_name(section));
 				break;
 			}
 		}
@@ -4387,6 +4582,17 @@ symbol_query(char *s, char *print_pad, struct syment **spp)
 	return(cnt);
 }
 
+static int
+skip_symbols(struct syment *sp, char *s)
+{
+	int pseudos, skip = FALSE;
+
+	pseudos = (strstr(s, "_MODULE_START_") || strstr(s, "_MODULE_END_") ||
+		strstr(s, "_MODULE_INIT_START_") || strstr(s, "_MODULE_INIT_END_"));
+	if (!pseudos && MODULE_PSEUDO_SYMBOL(sp))
+		skip = TRUE;
+	return skip;
+}
 
 /*
  *  Return the syment of a symbol.
@@ -4394,55 +4600,24 @@ symbol_query(char *s, char *print_pad, struct syment **spp)
 struct syment *
 symbol_search(char *s)
 {
-	int i;
-        struct syment *sp_hashed, *sp, *sp_end;
-	struct load_module *lm;
-	int pseudos, search_init;
+	struct syment *sp_hashed, *sp;
 
-	sp_hashed = symname_hash_search(s);
+	sp_hashed = symname_hash_search(st->symname_hash, s);
 
         for (sp = sp_hashed ? sp_hashed : st->symtable; sp < st->symend; sp++) {
                 if (STREQ(s, sp->name)) 
                         return(sp);
         }
 
-	pseudos = (strstr(s, "_MODULE_START_") || strstr(s, "_MODULE_END_"));
-	search_init = FALSE;
-
-        for (i = 0; i < st->mods_installed; i++) {
-                lm = &st->load_modules[i];
-		if (lm->mod_flags & MOD_INIT)
-			search_init = TRUE;
-		sp = lm->mod_symtable;
-                sp_end = lm->mod_symend;
-
-                for ( ; sp <= sp_end; sp++) {
-                	if (!pseudos && MODULE_PSEUDO_SYMBOL(sp))
-                        	continue;
-                	if (STREQ(s, sp->name))
-                        	return(sp);
-                }
-        }
-
-	if (!search_init)
-		return((struct syment *)NULL);
-
-	pseudos = (strstr(s, "_MODULE_INIT_START_") || strstr(s, "_MODULE_INIT_END_"));
-
-	for (i = 0; i < st->mods_installed; i++) {
-		lm = &st->load_modules[i];
-		if (!lm->mod_init_symtable)
+	sp = st->mod_symname_hash[symname_hash_index(s)];
+	while (sp) {
+		if (skip_symbols(sp, s)) {
+			sp = sp->name_hash_next;
 			continue;
-		sp = lm->mod_init_symtable;
-		sp_end = lm->mod_init_symend;
-
-		for ( ; sp < sp_end; sp++) {
-			if (!pseudos && MODULE_PSEUDO_SYMBOL(sp))
-				continue;
-
-			if (STREQ(s, sp->name))
-				return(sp);
 		}
+		if (STREQ(sp->name, s))
+			return sp;
+		sp = sp->name_hash_next;
 	}
 
         return((struct syment *)NULL);
@@ -5337,33 +5512,11 @@ value_symbol(ulong value)
 int
 symbol_exists(char *symbol)
 {
-	int i;
-        struct syment *sp, *sp_end;
-	struct load_module *lm;
-
-	if ((sp = symname_hash_search(symbol)))
+	if (symname_hash_search(st->symname_hash, symbol))
 		return TRUE;
 
-        for (i = 0; i < st->mods_installed; i++) {
-                lm = &st->load_modules[i];
-		sp = lm->mod_symtable;
-                sp_end = lm->mod_symend;
-
-                for ( ; sp < sp_end; sp++) {
-                	if (STREQ(symbol, sp->name))
-                        	return(TRUE);
-                }
-
-		if (lm->mod_init_symtable) {
-			sp = lm->mod_init_symtable;
-			sp_end = lm->mod_init_symend;
-	
-			for ( ; sp < sp_end; sp++) {
-				if (STREQ(symbol, sp->name))
-					return(TRUE);
-			}
-		}
-	}
+	if (symname_hash_search(st->mod_symname_hash, symbol))
+		return TRUE;
 
         return(FALSE);
 }
@@ -5418,12 +5571,7 @@ per_cpu_symbol_search(char *symbol)
 int
 kernel_symbol_exists(char *symbol)
 {
-	struct syment *sp;
-
-        if ((sp = symname_hash_search(symbol)))
-                return TRUE;
-	else
-        	return FALSE;
+	return !!symname_hash_search(st->symname_hash, symbol);
 }
 
 /*
@@ -5432,7 +5580,7 @@ kernel_symbol_exists(char *symbol)
 struct syment *
 kernel_symbol_search(char *symbol)
 {
-	return symname_hash_search(symbol);
+	return symname_hash_search(st->symname_hash, symbol);
 }
 
 /*
@@ -5526,18 +5674,21 @@ datatype_init(void)
 long
 datatype_info(char *name, char *member, struct datatype_member *dm)
 {
-	struct gnu_request *req;
-        long offset, size, member_size;
+	struct gnu_request request, *req = &request;
+	long offset, size, member_size;
 	int member_typecode;
-        ulong type_found;
+	ulong type_found;
 	char buf[BUFSIZE];
 
-        if (dm == ANON_MEMBER_OFFSET_REQUEST)
+	if (dm == ANON_MEMBER_OFFSET_REQUEST)
 		return anon_member_offset(name, member);
+
+	if (dm == ANON_MEMBER_SIZE_REQUEST)
+		return anon_member_size(name, member);
 
 	strcpy(buf, name);
 
-	req = (struct gnu_request *)GETBUF(sizeof(struct gnu_request));
+	BZERO(req, sizeof(*req));
 	req->command = GNU_GET_DATATYPE;
 	req->flags |= GNU_RETURN_ON_ERROR;
 	req->name = buf;
@@ -5545,10 +5696,8 @@ datatype_info(char *name, char *member, struct datatype_member *dm)
 	req->fp = pc->nullfp;
 
 	gdb_interface(req);
-	if (req->flags & GNU_COMMAND_FAILED) {
-		FREEBUF(req);
+	if (req->flags & GNU_COMMAND_FAILED)
 		return (dm == MEMBER_TYPE_NAME_REQUEST) ? 0 : -1;
-	}
 
 	if (!req->typecode) {
 		sprintf(buf, "struct %s", name);
@@ -5660,8 +5809,6 @@ datatype_info(char *name, char *member, struct datatype_member *dm)
 		break;
 	}
 
-	FREEBUF(req);
-
         if (dm && (dm != MEMBER_SIZE_REQUEST) && (dm != MEMBER_TYPE_REQUEST) &&
 	    (dm != STRUCT_SIZE_REQUEST) && (dm != MEMBER_TYPE_NAME_REQUEST)) {
                 dm->type = type_found;
@@ -5742,6 +5889,46 @@ retry:
 	if ((value == -1) && (type == STRUCT_REQUEST)) {
 		type = UNION_REQUEST;
 		sprintf(buf, "printf \"%%p\", &((union %s *)0x0)->%s", name, member);
+		rewind(pc->tmpfile2);
+		goto retry;
+	}
+
+	close_tmpfile2();
+
+	return value;
+}
+
+/*
+ *  Determine the size of a member in an anonymous union
+ *  in a structure or union.
+ */
+static long
+anon_member_size(char *name, char *member)
+{
+	char buf[BUFSIZE];
+	ulong value;
+	int type;
+
+	value = -1;
+	type = STRUCT_REQUEST;
+	sprintf(buf, "printf \"%%ld\", (u64)(&((struct %s*)0)->%s + 1) - (u64)&((struct %s*)0)->%s",
+		name, member, name, member);
+	open_tmpfile2();
+retry:
+	if (gdb_pass_through(buf, pc->tmpfile2, GNU_RETURN_ON_ERROR)) {
+		rewind(pc->tmpfile2);
+		if (fgets(buf, BUFSIZE, pc->tmpfile2)) {
+			if (hexadecimal(buf, 0))
+				value = htol(buf, RETURN_ON_ERROR|QUIET, NULL);
+			else if (STRNEQ(buf, "(nil)"))
+				value = 0;
+		}
+	}
+
+	if ((value == -1) && (type == STRUCT_REQUEST)) {
+		type = UNION_REQUEST;
+		sprintf(buf, "printf \"%%ld\", (u64)(&((union %s*)0)->%s + 1) - (u64)&((union %s*)0)->%s",
+			name, member, name, member);
 		rewind(pc->tmpfile2);
 		goto retry;
 	}
@@ -6540,6 +6727,8 @@ do_datatype_addr(struct datatype_member *dm, ulong addr, int count,
 		i = 0;
         	do {
                 	if (argc_members) {
+				if (argc_members > 1 && flags & SHOW_RAW_DATA)
+					error(FATAL, "only one structure member allowed with -r\n");
 				/* This call works fine with fields
 				 * of the second, third, ... levels.
 				 * There is no need to fix it
@@ -6548,9 +6737,6 @@ do_datatype_addr(struct datatype_member *dm, ulong addr, int count,
 							ANON_MEMBER_QUERY))
 					error(FATAL, "invalid data structure reference: %s.%s\n",
 					      dm->name, memberlist[i]);
-				if (flags & SHOW_RAW_DATA)
-        				error(FATAL, 
-					      "member-specific output not allowed with -r\n");
 			}
 
 			/*
@@ -6559,9 +6745,18 @@ do_datatype_addr(struct datatype_member *dm, ulong addr, int count,
 			if (flags & SHOW_OFFSET) {
 				dm->vaddr = addr;
 				do_datatype_declaration(dm, flags | (dm->flags & TYPEDEF));
-			} else if (flags & SHOW_RAW_DATA)
+			} else if (flags & SHOW_RAW_DATA) {
+				if (dm->member) {
+					addr += dm->member_offset;
+					len = MEMBER_SIZE(dm->name, dm->member);
+					if (len < 0)
+						len = ANON_MEMBER_SIZE(dm->name, dm->member);
+					if (len < 0)
+						error(FATAL, "invalid data structure reference: %s.%s\n",
+						      dm->name, dm->member);
+				}
 				raw_data_dump(addr, len, flags & STRUCT_VERBOSE);
-			else if ((flags & DEREF_POINTERS) && !dm->member) {
+			} else if ((flags & DEREF_POINTERS) && !dm->member) {
 				print_struct_with_dereference(addr, dm, flags);
                 	} else {
 	                        if (dm->member)
@@ -6854,13 +7049,14 @@ compare_size_name(const void *va, const void *vb) {
 }
 
 static void
-append_struct_symbol (struct type_request *treq,  struct gnu_request *req)
+append_struct_symbol (struct gnu_request *req, void *data)
 {
 	int i; 
 	long s;
+	struct type_request *treq = (struct type_request *)data;
 
 	for (i = 0; i < treq->idx; i++)
-		if (treq->types[i].name == req->name)
+		if (!strcmp(treq->types[i].name, req->name))
 			break;
 
 	if (i < treq->idx) // We've already collected this type
@@ -6895,22 +7091,13 @@ request_types(ulong lowest, ulong highest, char *member_name)
 	request.type_name = member_name;
 #endif
 
-	while (!request.global_iterator.finished) {
-		request.command = GNU_GET_NEXT_DATATYPE;
-		gdb_interface(&request);
-		if (highest && 
-		    !(lowest <= request.length && request.length <= highest))
-			continue;
-
-		if (member_name) {
-			request.command = GNU_LOOKUP_STRUCT_CONTENTS;
-			gdb_interface(&request);
-			if (!request.value)
-				continue;
-		}
-
-		append_struct_symbol(&typereq, &request);		
-	}
+        request.command = GNU_ITERATE_DATATYPES;
+        request.lowest = lowest;
+        request.highest = highest;
+        request.member = member_name;
+        request.callback = append_struct_symbol;
+        request.callback_data = (void *)&typereq;
+        gdb_interface(&request);
 
 	qsort(typereq.types, typereq.idx, sizeof(struct type_info), compare_size_name);
 
@@ -7786,7 +7973,8 @@ parse_for_member(struct datatype_member *dm, ulong flag)
 		sprintf(lookfor2, "  %s[", s);
 next_item:
 		while (fgets(buf, BUFSIZE, pc->tmpfile)) {
-			if (embed && (count_leading_spaces(buf) == embed))
+			if ((embed && (count_leading_spaces(buf) == embed)) ||
+				(strstr(buf, "}}") && embed == count_leading_spaces(buf) - 2))
 				embed = 0;
 
 			if (!on && !embed && strstr(buf, "= {") && !strstr(buf, lookfor1))
@@ -7806,6 +7994,11 @@ next_item:
 			if (on) {
 				if ((indent && (on > 1) && (count_leading_spaces(buf) == indent) &&
 				    !strstr(buf, "}")) || (buf[0] == '}')) {
+					break;
+				}
+				if (indent && (on > 1) && indent == count_leading_spaces(buf) - 2 &&
+					strstr(buf, "}}")) {
+					fprintf(pc->saved_fp, "%s", buf);
 					break;
 				}
 				if (!indent) {
@@ -8116,8 +8309,10 @@ parse_for_member_extended(struct datatype_member *dm,
 		 */
 
 		if (current && p && (p - p1 < BUFSIZE)) {
-			strncpy(current->field_name, p1, p - p1);
+//			strncpy(current->field_name, p1, p - p1);  (NOTE: gcc-9.0.1 emits [-Wstringop-truncation] warning)
 			current->field_len = p - p1;
+			memcpy(current->field_name, p1, current->field_len);
+			current->field_name[current->field_len] = '\0';
 		}
 
 		if ( p && (*s_e != '{' || (*s_e == '{' && buf[len] == '}') )) {
@@ -8216,8 +8411,15 @@ show_member_offset(FILE *ofp, struct datatype_member *dm, char *inbuf)
 		}
 	} else if (c) { 
 		for (i = 0; i < c; i++) {
-			if (STRNEQ(arglist[i], "(*")) {
-				target = arglist[i]+2;
+			if (strstr(inbuf, "(*")) {
+				if (STRNEQ(arglist[i], "(*"))
+					target = arglist[i]+2;
+				else if (STRNEQ(arglist[i], "*(*"))
+					target = arglist[i]+3;
+				else if (STRNEQ(arglist[i], "**(*"))
+					target = arglist[i]+4;
+				else
+					continue;
 				if (!(t1 = strstr(target, ")")))
 					continue;
 				*t1 = NULLCHAR;
@@ -8985,12 +9187,28 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(module_core_size));
 	fprintf(fp, "         module_core_text_size: %ld\n",
 		OFFSET(module_core_text_size));
-	fprintf(fp, "         module_init_size: %ld\n",
+	fprintf(fp, "              module_init_size: %ld\n",
 		OFFSET(module_init_size));
 	fprintf(fp, "         module_init_text_size: %ld\n",
 		OFFSET(module_init_text_size));
 	fprintf(fp, "            module_module_init: %ld\n",
 		OFFSET(module_module_init));
+	fprintf(fp, "         module_module_core_rx: %ld\n",
+		OFFSET(module_module_core_rx));
+	fprintf(fp, "         module_module_core_rw: %ld\n",
+		OFFSET(module_module_core_rw));
+	fprintf(fp, "           module_core_size_rx: %ld\n",
+		OFFSET(module_core_size_rx));
+	fprintf(fp, "           module_core_size_rw: %ld\n",
+		OFFSET(module_core_size_rw));
+	fprintf(fp, "         module_module_init_rx: %ld\n",
+		OFFSET(module_module_init_rx));
+	fprintf(fp, "         module_module_init_rw: %ld\n",
+		OFFSET(module_module_init_rw));
+	fprintf(fp, "           module_init_size_rx: %ld\n",
+		OFFSET(module_init_size_rx));
+	fprintf(fp, "           module_init_size_rw: %ld\n",
+		OFFSET(module_init_size_rw));
 	fprintf(fp, "             module_num_symtab: %ld\n",
 		OFFSET(module_num_symtab));
 	fprintf(fp, "                 module_symtab: %ld\n",
@@ -9137,6 +9355,10 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(block_device_bd_list));
 	fprintf(fp, "          block_device_bd_disk: %ld\n",
 		OFFSET(block_device_bd_disk));
+	fprintf(fp, "        block_device_bd_device: %ld\n",
+		OFFSET(block_device_bd_device));
+	fprintf(fp, "         block_device_bd_stats: %ld\n",
+		OFFSET(block_device_bd_stats));
 	fprintf(fp, "         address_space_nrpages: %ld\n",
 		OFFSET(address_space_nrpages));
 	fprintf(fp, "       address_space_page_tree: %ld\n",
@@ -9176,8 +9398,12 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(irq_data_chip));
 	fprintf(fp, "             irq_data_affinity: %ld\n",
 		OFFSET(irq_data_affinity));
+	fprintf(fp, "      irq_common_data_affinity: %ld\n",
+		OFFSET(irq_common_data_affinity));
 	fprintf(fp, "             irq_desc_irq_data: %ld\n",
 		OFFSET(irq_desc_irq_data));
+	fprintf(fp, "      irq_desc_irq_common_data: %ld\n",
+		OFFSET(irq_desc_irq_common_data));
 	fprintf(fp, "              kernel_stat_irqs: %ld\n",
 		OFFSET(kernel_stat_irqs));
 
@@ -9318,6 +9544,8 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(inode_i_fop)); 
 	fprintf(fp, "               inode_i_mapping: %ld\n",
 		OFFSET(inode_i_mapping));
+	fprintf(fp, "               inode_i_sb_list: %ld\n",
+		OFFSET(inode_i_sb_list));
 
         fprintf(fp, "             vfsmount_mnt_next: %ld\n", 
 		OFFSET(vfsmount_mnt_next));
@@ -9354,6 +9582,8 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(super_block_s_type));
         fprintf(fp, "           super_block_s_files: %ld\n", 
 		OFFSET(super_block_s_files));
+	fprintf(fp, "          super_block_s_inodes: %ld\n",
+		OFFSET(super_block_s_inodes));
 
 	fprintf(fp, "               nlm_file_f_file: %ld\n",
 		OFFSET(nlm_file_f_file));
@@ -9632,7 +9862,13 @@ dump_offset_table(char *spec, ulong makestruct)
         	OFFSET(__wait_queue_head_task_list));
         fprintf(fp, "        __wait_queue_task_list: %ld\n", 
         	OFFSET(__wait_queue_task_list));
- 
+	fprintf(fp, "      wait_queue_entry_private: %ld\n",
+		OFFSET(wait_queue_entry_private));
+	fprintf(fp, "          wait_queue_head_head: %ld\n",
+		OFFSET(wait_queue_head_head));
+	fprintf(fp, "        wait_queue_entry_entry: %ld\n",
+		OFFSET(wait_queue_entry_entry));
+
 	fprintf(fp, "        pglist_data_node_zones: %ld\n",
 		OFFSET(pglist_data_node_zones));
 	fprintf(fp, "      pglist_data_node_mem_map: %ld\n",
@@ -9974,6 +10210,8 @@ dump_offset_table(char *spec, ulong makestruct)
                 OFFSET(rb_node_rb_left));
         fprintf(fp, "              rb_node_rb_right: %ld\n",
                 OFFSET(rb_node_rb_right));
+        fprintf(fp, "    rb_root_cached_rb_leftmost: %ld\n",
+                OFFSET(rb_root_cached_rb_leftmost));
 
 	fprintf(fp, "            x8664_pda_pcurrent: %ld\n",
 		OFFSET(x8664_pda_pcurrent));
@@ -10147,6 +10385,12 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(kset_list));
 	fprintf(fp, "            request_list_count: %ld\n",
 		OFFSET(request_list_count));
+	fprintf(fp, "             request_cmd_flags: %ld\n",
+		OFFSET(request_cmd_flags));
+	fprintf(fp, "                     request_q: %ld\n",
+		OFFSET(request_q));
+	fprintf(fp, "                 request_state: %ld\n",
+		OFFSET(request_state));
 	fprintf(fp, "       request_queue_in_flight: %ld\n",
 		OFFSET(request_queue_in_flight));
 	fprintf(fp, "              request_queue_rq: %ld\n",
@@ -10155,10 +10399,27 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(request_queue_mq_ops));
 	fprintf(fp, "       request_queue_queue_ctx: %ld\n",
 		OFFSET(request_queue_queue_ctx));
+	fprintf(fp, "    request_queue_queue_hw_ctx: %ld\n",
+		OFFSET(request_queue_queue_hw_ctx));
+	fprintf(fp, "    request_queue_nr_hw_queues: %ld\n",
+		OFFSET(request_queue_nr_hw_queues));
+	fprintf(fp, "      request_queue_hctx_table: %ld\n",
+		OFFSET(request_queue_hctx_table));
 	fprintf(fp, "      blk_mq_ctx_rq_dispatched: %ld\n",
 		OFFSET(blk_mq_ctx_rq_dispatched));
 	fprintf(fp, "       blk_mq_ctx_rq_completed: %ld\n",
 		OFFSET(blk_mq_ctx_rq_completed));
+	fprintf(fp, "            blk_mq_hw_ctx_tags: %ld\n",
+		OFFSET(blk_mq_hw_ctx_tags));
+	fprintf(fp, "       blk_mq_tags_bitmap_tags: %ld\n",
+		OFFSET(blk_mq_tags_bitmap_tags));
+	fprintf(fp, "    blk_mq_tags_breserved_tags: %ld\n",
+		OFFSET(blk_mq_tags_breserved_tags));
+	fprintf(fp, "  blk_mq_tags_nr_reserved_tags: %ld\n",
+		OFFSET(blk_mq_tags_nr_reserved_tags));
+	fprintf(fp, "               blk_mq_tags_rqs: %ld\n",
+		OFFSET(blk_mq_tags_rqs));
+
 	fprintf(fp, "  subsys_private_klist_devices: %ld\n",
 		OFFSET(subsys_private_klist_devices));
 	fprintf(fp, "                subsystem_kset: %ld\n",
@@ -10262,6 +10523,34 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(log_level));
 	fprintf(fp, "               log_flags_level: %ld\n",
 		OFFSET(log_flags_level));
+
+	fprintf(fp, "               printk_info_seq: %ld\n", OFFSET(printk_info_seq));
+	fprintf(fp, "           printk_info_ts_nseq: %ld\n", OFFSET(printk_info_ts_nsec));
+	fprintf(fp, "          printk_info_text_len: %ld\n", OFFSET(printk_info_text_len));
+	fprintf(fp, "             printk_info_level: %ld\n", OFFSET(printk_info_level));
+	fprintf(fp, "         printk_info_caller_id: %ld\n", OFFSET(printk_info_caller_id));
+	fprintf(fp, "          printk_info_dev_info: %ld\n", OFFSET(printk_info_dev_info));
+	fprintf(fp, "     dev_printk_info_subsystem: %ld\n", OFFSET(dev_printk_info_subsystem));
+	fprintf(fp, "        dev_printk_info_device: %ld\n", OFFSET(dev_printk_info_device));
+	fprintf(fp, "                 prb_desc_ring: %ld\n", OFFSET(prb_desc_ring));
+	fprintf(fp, "            prb_text_data_ring: %ld\n", OFFSET(prb_text_data_ring));
+	fprintf(fp, "      prb_desc_ring_count_bits: %ld\n", OFFSET(prb_desc_ring_count_bits));
+	fprintf(fp, "           prb_desc_ring_descs: %ld\n", OFFSET(prb_desc_ring_descs));
+	fprintf(fp, "           prb_desc_ring_infos: %ld\n", OFFSET(prb_desc_ring_infos));
+	fprintf(fp, "         prb_desc_ring_head_id: %ld\n", OFFSET(prb_desc_ring_head_id));
+	fprintf(fp, "         prb_desc_ring_tail_id: %ld\n", OFFSET(prb_desc_ring_tail_id));
+	fprintf(fp, "            prb_desc_state_var: %ld\n", OFFSET(prb_desc_state_var));
+	fprintf(fp, "        prb_desc_text_blk_lpos: %ld\n", OFFSET(prb_desc_text_blk_lpos));
+	fprintf(fp, "       prb_data_blk_lpos_begin: %ld\n", OFFSET(prb_data_blk_lpos_begin));
+	fprintf(fp, "        prb_data_blk_lpos_next: %ld\n", OFFSET(prb_data_blk_lpos_next));
+	fprintf(fp, "       prb_data_ring_size_bits: %ld\n", OFFSET(prb_data_ring_size_bits));
+	fprintf(fp, "            prb_data_ring_data: %ld\n", OFFSET(prb_data_ring_data));
+	fprintf(fp, "         atomit_long_t_counter: %ld\n", OFFSET(atomic_long_t_counter));
+	fprintf(fp, "       printk_safe_seq_buf_len: %ld\n", OFFSET(printk_safe_seq_buf_len));
+	fprintf(fp, "printk_safe_seq_buf_message_lost: %ld\n",
+		OFFSET(printk_safe_seq_buf_message_lost));
+	fprintf(fp, "    printk_safe_seq_buf_buffer: %ld\n", OFFSET(printk_safe_seq_buf_buffer));
+
 	fprintf(fp, "          sched_rt_entity_my_q: %ld\n",
 		OFFSET(sched_rt_entity_my_q));
 	fprintf(fp, "             task_group_parent: %ld\n",
@@ -10330,6 +10619,8 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(hrtimer_function));
 	fprintf(fp, "          timerqueue_head_next: %ld\n",
 		OFFSET(timerqueue_head_next));
+	fprintf(fp, "       timerqueue_head_rb_root: %ld\n",
+		OFFSET(timerqueue_head_rb_root));
 	fprintf(fp, "       timerqueue_node_expires: %ld\n",
 		OFFSET(timerqueue_node_expires));
 	fprintf(fp, "          timerqueue_node_node: %ld\n",
@@ -10396,6 +10687,12 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(bpf_map_name));
 	fprintf(fp, "                  bpf_map_user: %ld\n",
 		OFFSET(bpf_map_user));
+	fprintf(fp, "                bpf_map_memory: %ld\n",
+		OFFSET(bpf_map_memory));
+	fprintf(fp, "          bpf_map_memory_pages: %ld\n",
+		OFFSET(bpf_map_memory_pages));
+	fprintf(fp, "           bpf_map_memory_user: %ld\n",
+		OFFSET(bpf_map_memory_user));
 
 	fprintf(fp, "     bpf_prog_aux_used_map_cnt: %ld\n",
 		OFFSET(bpf_prog_aux_used_map_cnt));
@@ -10405,6 +10702,8 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(bpf_prog_aux_load_time));
 	fprintf(fp, "             bpf_prog_aux_user: %ld\n",
 		OFFSET(bpf_prog_aux_user));
+	fprintf(fp, "             bpf_prog_aux_name: %ld\n",
+		OFFSET(bpf_prog_aux_name));
 	fprintf(fp, "               user_struct_uid: %ld\n",
 		OFFSET(user_struct_uid));
 
@@ -10414,6 +10713,48 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(xa_node_slots));
 	fprintf(fp, "                 xa_node_shift: %ld\n",
 		OFFSET(xa_node_shift));
+
+	fprintf(fp, "            uts_namespace_name: %ld\n",
+		OFFSET(uts_namespace_name));
+
+	fprintf(fp, "            sbitmap_word_depth: %ld\n",
+		OFFSET(sbitmap_word_depth));
+	fprintf(fp, "             sbitmap_word_word: %ld\n",
+		OFFSET(sbitmap_word_word));
+	fprintf(fp, "          sbitmap_word_cleared: %ld\n",
+		OFFSET(sbitmap_word_cleared));
+	fprintf(fp, "                 sbitmap_depth: %ld\n",
+		OFFSET(sbitmap_depth));
+	fprintf(fp, "                 sbitmap_shift: %ld\n",
+		OFFSET(sbitmap_shift));
+	fprintf(fp, "                sbitmap_map_nr: %ld\n",
+		OFFSET(sbitmap_map_nr));
+	fprintf(fp, "                   sbitmap_map: %ld\n",
+		OFFSET(sbitmap_map));
+	fprintf(fp, "            sbitmap_alloc_hint: %ld\n",
+		OFFSET(sbitmap_alloc_hint));
+	fprintf(fp, "           sbitmap_round_robin: %ld\n",
+		OFFSET(sbitmap_round_robin));
+	fprintf(fp, "              sbitmap_queue_sb: %ld\n",
+		OFFSET(sbitmap_queue_sb));
+	fprintf(fp, "      sbitmap_queue_alloc_hint: %ld\n",
+		OFFSET(sbitmap_queue_alloc_hint));
+	fprintf(fp, "      sbitmap_queue_wake_batch: %ld\n",
+		OFFSET(sbitmap_queue_wake_batch));
+	fprintf(fp, "      sbitmap_queue_wake_index: %ld\n",
+		OFFSET(sbitmap_queue_wake_index));
+	fprintf(fp, "              sbitmap_queue_ws: %ld\n",
+		OFFSET(sbitmap_queue_ws));
+	fprintf(fp, "       sbitmap_queue_ws_active: %ld\n",
+		OFFSET(sbitmap_queue_ws_active));
+	fprintf(fp, "     sbitmap_queue_round_robin: %ld\n",
+		OFFSET(sbitmap_queue_round_robin));
+	fprintf(fp, "sbitmap_queue_min_shallow_depth: %ld\n",
+		OFFSET(sbitmap_queue_min_shallow_depth));
+	fprintf(fp, "       sbq_wait_state_wait_cnt: %ld\n",
+		OFFSET(sbq_wait_state_wait_cnt));
+	fprintf(fp, "           sbq_wait_state_wait: %ld\n",
+		OFFSET(sbq_wait_state_wait));
 
 	fprintf(fp, "\n                    size_table:\n");
 	fprintf(fp, "                          page: %ld\n", SIZE(page));
@@ -10448,6 +10789,7 @@ dump_offset_table(char *spec, ulong makestruct)
 		SIZE(page_cache_bucket));
         fprintf(fp, "                       pt_regs: %ld\n", SIZE(pt_regs));
         fprintf(fp, "                   task_struct: %ld\n", SIZE(task_struct));
+	fprintf(fp, "             task_struct_state: %ld\n", SIZE(task_struct_state));
         fprintf(fp, "             task_struct_flags: %ld\n", SIZE(task_struct_flags));
         fprintf(fp, "            task_struct_policy: %ld\n", SIZE(task_struct_policy));
         fprintf(fp, "                   thread_info: %ld\n", SIZE(thread_info));
@@ -10493,6 +10835,8 @@ dump_offset_table(char *spec, ulong makestruct)
 	fprintf(fp, "                    wait_queue: %ld\n", SIZE(wait_queue));
 	fprintf(fp, "                  __wait_queue: %ld\n", 
 		SIZE(__wait_queue));
+	fprintf(fp, "              wait_queue_entry: %ld\n",
+		SIZE(wait_queue_entry));
 	fprintf(fp, "                        device: %ld\n", SIZE(device));
 	fprintf(fp, "                    net_device: %ld\n", SIZE(net_device));
 
@@ -10517,6 +10861,7 @@ dump_offset_table(char *spec, ulong makestruct)
 	fprintf(fp, "                      runqueue: %ld\n", SIZE(runqueue));
 	fprintf(fp, "                    irq_desc_t: %ld\n", SIZE(irq_desc_t));
 	fprintf(fp, "                      irq_data: %ld\n", SIZE(irq_data));
+	fprintf(fp, "               irq_common_data: %ld\n", SIZE(irq_common_data));
 	fprintf(fp, "                    task_union: %ld\n", SIZE(task_union));
 	fprintf(fp, "                  thread_union: %ld\n", SIZE(thread_union));
 	fprintf(fp, "                    prio_array: %ld\n", SIZE(prio_array));
@@ -10672,7 +11017,16 @@ dump_offset_table(char *spec, ulong makestruct)
 		SIZE(xarray));
 	fprintf(fp, "                       xa_node: %ld\n",
 		SIZE(xa_node));
+	fprintf(fp, "                   printk_info: %ld\n", SIZE(printk_info));
+	fprintf(fp, "             printk_ringbuffer: %ld\n", SIZE(printk_ringbuffer));
+	fprintf(fp, "                      prb_desc: %ld\n", SIZE(prb_desc));
+	fprintf(fp, "    printk_safe_seq_buf_buffer: %ld\n", SIZE(printk_safe_seq_buf_buffer));
 
+	fprintf(fp, "                  sbitmap_word: %ld\n", SIZE(sbitmap_word));
+	fprintf(fp, "                       sbitmap: %ld\n", SIZE(sbitmap));
+	fprintf(fp, "                 sbitmap_queue: %ld\n", SIZE(sbitmap_queue));
+	fprintf(fp, "                sbq_wait_state: %ld\n", SIZE(sbq_wait_state));
+	fprintf(fp, "                   blk_mq_tags: %ld\n", SIZE(blk_mq_tags));
 
         fprintf(fp, "\n                   array_table:\n");
 	/*
@@ -10955,39 +11309,39 @@ section_header_info(bfd *bfd, asection *section, void *reqptr)
 			sec++;
 		*sec = section;
 
-        	if (STREQ(bfd_get_section_name(bfd, section), ".text.init") ||
-		    STREQ(bfd_get_section_name(bfd, section), ".init.text")) {
+		if (STREQ(bfd_section_name(section), ".text.init") ||
+		    STREQ(bfd_section_name(section), ".init.text")) {
                 	kt->stext_init = (ulong)
-				bfd_get_section_vma(bfd, section);
+				bfd_section_vma(section);
                 	kt->etext_init = kt->stext_init +
-                        	(ulong)bfd_section_size(bfd, section);
+				(ulong)bfd_section_size(section);
 		}
 
-		if (STREQ(bfd_get_section_name(bfd, section), ".text")) {
+		if (STREQ(bfd_section_name(section), ".text")) {
 			st->first_section_start = (ulong)
-				bfd_get_section_vma(bfd, section);
+				bfd_section_vma(section);
 		}
-                if (STREQ(bfd_get_section_name(bfd, section), ".text") ||
-                    STREQ(bfd_get_section_name(bfd, section), ".data")) {
-                        if (!(bfd_get_section_flags(bfd, section) & SEC_LOAD))
+                if (STREQ(bfd_section_name(section), ".text") ||
+                    STREQ(bfd_section_name(section), ".data")) {
+                        if (!(bfd_section_flags(section) & SEC_LOAD))
                                 st->flags |= NO_SEC_LOAD;
-                        if (!(bfd_get_section_flags(bfd, section) &
+                        if (!(bfd_section_flags(section) &
                             SEC_HAS_CONTENTS))
                                 st->flags |= NO_SEC_CONTENTS;
                 }
-                if (STREQ(bfd_get_section_name(bfd, section), ".eh_frame")) {
+                if (STREQ(bfd_section_name(section), ".eh_frame")) {
 			st->dwarf_eh_frame_file_offset = (off_t)section->filepos;
-			st->dwarf_eh_frame_size = (ulong)bfd_section_size(bfd, section);
+			st->dwarf_eh_frame_size = (ulong)bfd_section_size(section);
 		}
-                if (STREQ(bfd_get_section_name(bfd, section), ".debug_frame")) {
+                if (STREQ(bfd_section_name(section), ".debug_frame")) {
 			st->dwarf_debug_frame_file_offset = (off_t)section->filepos;
-			st->dwarf_debug_frame_size = (ulong)bfd_section_size(bfd, section);
+			st->dwarf_debug_frame_size = (ulong)bfd_section_size(section);
 		}
 
 		if (st->first_section_start != 0) {
 			section_end_address =
-				(ulong) bfd_get_section_vma(bfd, section) +
-				(ulong) bfd_section_size(bfd, section);
+				(ulong) bfd_section_vma(section) +
+				(ulong) bfd_section_size(section);
 			if (section_end_address > st->last_section_end)
 				st->last_section_end = section_end_address;
 		}
@@ -10999,21 +11353,21 @@ section_header_info(bfd *bfd, asection *section, void *reqptr)
 		break;
 
 	case (ulong)VERIFY_SECTIONS:
-		if (STREQ(bfd_get_section_name(bfd, section), ".text") ||
-		    STREQ(bfd_get_section_name(bfd, section), ".data")) {
-			if (!(bfd_get_section_flags(bfd, section) & SEC_LOAD))
+		if (STREQ(bfd_section_name(section), ".text") ||
+		    STREQ(bfd_section_name(section), ".data")) {
+			if (!(bfd_section_flags(section) & SEC_LOAD))
 				st->flags |= NO_SEC_LOAD;
-			if (!(bfd_get_section_flags(bfd, section) & 
+			if (!(bfd_section_flags(section) &
 			    SEC_HAS_CONTENTS))
 				st->flags |= NO_SEC_CONTENTS;
 		}
-                if (STREQ(bfd_get_section_name(bfd, section), ".eh_frame")) {
+                if (STREQ(bfd_section_name(section), ".eh_frame")) {
 			st->dwarf_eh_frame_file_offset = (off_t)section->filepos;
-			st->dwarf_eh_frame_size = (ulong)bfd_section_size(bfd, section);
+			st->dwarf_eh_frame_size = (ulong)bfd_section_size(section);
 		}
-                if (STREQ(bfd_get_section_name(bfd, section), ".debug_frame")) {
+                if (STREQ(bfd_section_name(section), ".debug_frame")) {
 			st->dwarf_debug_frame_file_offset = (off_t)section->filepos;
-			st->dwarf_debug_frame_size = (ulong)bfd_section_size(bfd, section);
+			st->dwarf_debug_frame_size = (ulong)bfd_section_size(section);
 		}
 		break;
 
@@ -11053,7 +11407,7 @@ store_section_data(struct load_module *lm, bfd *bfd, asection *section)
 	char *name;
 
 	prio = 0;
-	name = (char *)bfd_get_section_name(bfd, section);
+	name = (char *)bfd_section_name(section);
 
         if (name[0] != '.' || strlen(name) != 10 || strcmp(name + 5, ".init")) 
 		prio |= 32;
@@ -11075,10 +11429,10 @@ store_section_data(struct load_module *lm, bfd *bfd, asection *section)
 	 */
 	if (lm->mod_percpu &&
 	    (STREQ(name,".data.percpu") || STREQ(name, ".data..percpu"))) {
-		lm->mod_percpu_size = bfd_section_size(bfd, section);
+		lm->mod_percpu_size = bfd_section_size(section);
 		lm->mod_section_data[i].flags |= SEC_FOUND;
 	}
-	lm->mod_section_data[i].size = bfd_section_size(bfd, section);
+	lm->mod_section_data[i].size = bfd_section_size(section);
 	lm->mod_section_data[i].offset = 0;
 	if (strlen(name) < MAX_MOD_SEC_NAME)
 		strcpy(lm->mod_section_data[i].name, name);
@@ -11156,7 +11510,7 @@ calculate_load_order_v1(struct load_module *lm, bfd *bfd)
 	for (i = (lm->mod_sections-1); i >= 0; i--) {
 		section = lm->mod_section_data[i].section;
 
-               	alignment = power(2, bfd_get_section_alignment(bfd, section));
+		alignment = power(2, bfd_section_alignment(section));
 
                 if (alignment && (offset & (alignment - 1)))
                 	offset = (offset | (alignment - 1)) + 1;
@@ -11185,9 +11539,9 @@ calculate_load_order_v1(struct load_module *lm, bfd *bfd)
                 if (STREQ(lm->mod_section_data[i].name, ".rodata"))
                         lm->mod_rodata_start = lm->mod_base + offset;
 
-		offset += bfd_section_size(bfd, section);
+		offset += bfd_section_size(section);
 
-                if (STREQ(bfd_get_section_name(bfd, section), ".kstrtab"))
+                if (STREQ(bfd_section_name(section), ".kstrtab"))
                 	offset += strlen(lm->mod_name)+1;
         }
 }
@@ -11264,7 +11618,7 @@ calculate_load_order_v2(struct load_module *lm, bfd *bfd, int dynamic,
                                 (long) syminfo.value);
                     }
 		    if (strcmp(syminfo.name, s1->name) == 0) {
-			    secname = (char *)bfd_get_section_name(bfd, sym->section);
+			    secname = (char *)bfd_section_name(sym->section);
 			    break;
 		    }
 
@@ -12012,7 +12366,7 @@ store_load_module_symbols(bfd *bfd, int dynamic, void *minisyms,
 
                 bfd_get_symbol_info(bfd, sym, &syminfo);
 
-		secname = (char *)bfd_get_section_name(bfd, sym->section);
+		secname = (char *)bfd_section_name(sym->section);
                 found = 0;
 
                 if (kt->flags & KMOD_V1) {
@@ -12227,8 +12581,10 @@ store_load_module_symbols(bfd *bfd, int dynamic, void *minisyms,
 		error(INFO, "%s: last symbol: %s is not _MODULE_END_%s?\n",
 			lm->mod_name, lm->mod_load_symend->name, lm->mod_name);
 
+	mod_symtable_hash_remove_range(lm->mod_symtable, lm->mod_symend);
         lm->mod_symtable = lm->mod_load_symtable;
         lm->mod_symend = lm->mod_load_symend;
+	mod_symtable_hash_install_range(lm->mod_symtable, lm->mod_symend);
 
 	lm->mod_flags &= ~MOD_EXT_SYMS;
 	lm->mod_flags |= MOD_LOAD_SYMS;
@@ -12258,6 +12614,7 @@ delete_load_module(ulong base_addr)
         			req->name = lm->mod_namelist;
         			gdb_interface(req); 
 			}
+			mod_symtable_hash_remove_range(lm->mod_symtable, lm->mod_symend);
 			if (lm->mod_load_symtable) {
                         	free(lm->mod_load_symtable);
                                 namespace_ctl(NAMESPACE_FREE,
@@ -12267,6 +12624,7 @@ delete_load_module(ulong base_addr)
 				unlink_module(lm);
 			lm->mod_symtable = lm->mod_ext_symtable;
 			lm->mod_symend = lm->mod_ext_symend;
+			mod_symtable_hash_install_range(lm->mod_symtable, lm->mod_symend);
 			lm->mod_flags &= ~(MOD_LOAD_SYMS|MOD_REMOTE|MOD_NOPATCH);
 			lm->mod_flags |= MOD_EXT_SYMS;
 			lm->mod_load_symtable = NULL;
@@ -12295,6 +12653,7 @@ delete_load_module(ulong base_addr)
                         	req->name = lm->mod_namelist;
                         	gdb_interface(req);
 			}
+			mod_symtable_hash_remove_range(lm->mod_symtable, lm->mod_symend);
 			if (lm->mod_load_symtable) {
                         	free(lm->mod_load_symtable);
 				namespace_ctl(NAMESPACE_FREE,
@@ -12304,6 +12663,7 @@ delete_load_module(ulong base_addr)
 				unlink_module(lm);
 			lm->mod_symtable = lm->mod_ext_symtable;
 			lm->mod_symend = lm->mod_ext_symend;
+			mod_symtable_hash_install_range(lm->mod_symtable, lm->mod_symend);
                         lm->mod_flags &= ~(MOD_LOAD_SYMS|MOD_REMOTE|MOD_NOPATCH);
                         lm->mod_flags |= MOD_EXT_SYMS;
                         lm->mod_load_symtable = NULL;
@@ -12536,9 +12896,11 @@ numeric_forward(const void *P_x, const void *P_y)
 
 	if (SADUMP_DUMPFILE() || QEMU_MEM_DUMP_NO_VMCOREINFO() || VMSS_DUMPFILE()) {
 		/* Need for kaslr_offset and phys_base */
-		if (STREQ(x->name, "divide_error"))
+		if (STREQ(x->name, "divide_error") ||
+		    STREQ(x->name, "asm_exc_divide_error"))
 			st->divide_error_vmlinux = valueof(x);
-		else if (STREQ(y->name, "divide_error"))
+		else if (STREQ(y->name, "divide_error") ||
+			 STREQ(y->name, "asm_exc_divide_error"))
 			st->divide_error_vmlinux = valueof(y);
 
 		if (STREQ(x->name, "idt_table"))
@@ -12546,19 +12908,29 @@ numeric_forward(const void *P_x, const void *P_y)
 		else if (STREQ(y->name, "idt_table"))
 			st->idt_table_vmlinux = valueof(y);
 
+		if (STREQ(x->name, "kaiser_init"))
+			st->kaiser_init_vmlinux = valueof(x);
+		else if (STREQ(y->name, "kaiser_init"))
+			st->kaiser_init_vmlinux = valueof(y);
+
+		if (STREQ(x->name, "linux_banner"))
+			st->linux_banner_vmlinux = valueof(x);
+		else if (STREQ(y->name, "linux_banner"))
+			st->linux_banner_vmlinux = valueof(y);
+
+		if (STREQ(x->name, "pti_init"))
+			st->pti_init_vmlinux = valueof(x);
+		else if (STREQ(y->name, "pti_init"))
+			st->pti_init_vmlinux = valueof(y);
+
 		if (STREQ(x->name, "saved_command_line"))
 			st->saved_command_line_vmlinux = valueof(x);
 		else if (STREQ(y->name, "saved_command_line"))
 			st->saved_command_line_vmlinux = valueof(y);
-
-		if (STREQ(x->name, "pti_init"))
-			st->pti_init_vmlinux = valueof(x);
-		else if (STREQ(y->name, "kaiser_init"))
-			st->kaiser_init_vmlinux = valueof(y);
 	}
 
-  	xs = bfd_get_section(x);
-  	ys = bfd_get_section(y);
+	xs = bfd_asymbol_section(x);
+	ys = bfd_asymbol_section(y);
 
   	if (bfd_is_und_section(xs)) {
       		if (!bfd_is_und_section(ys))
@@ -12585,202 +12957,6 @@ gnu_qsort(bfd *bfd,
 	gnu_sort_y = y;
 	
         qsort(minisyms, symcount, size, numeric_forward);
-}
-
-/*
- *  Keep a stash of commonly-accessed text locations checked by the 
- *  back_trace code.  The saved values unsigned 32-bit values.
- *  The same routine is used to store and query, based upon whether
- *  the passed-in value and valptr args are non-zero.
- */
-#define TEXT_CACHE     (50)
-#define MAX_TEXT_CACHE (TEXT_CACHE*4)
-
-struct text_cache_entry {
-	ulong vaddr;
-	uint32_t value;
-};
-
-static struct text_cache {
-	int index;
-	int entries;
-	ulong hits;
-	ulong refs;
-	struct text_cache_entry *cache;
-} text_cache = { 0 };
-
-/*
- *  Cache the contents of 32-bit text addresses.  If "value" is set, the purpose
- *  is to cache it.  If "valptr" is set, a query is being made for the text
- *  address.
- */
-int
-text_value_cache(ulong vaddr, uint32_t value, uint32_t *valptr)
-{
-	int i;
-	struct text_cache *tc;
-
-	if (!is_kernel_text(vaddr)) 
-		return FALSE;	
-
-	tc = &text_cache;
-
-	if (!tc->cache) {
-		if (!(tc->cache = (struct text_cache_entry *)
-		    malloc(sizeof(struct text_cache_entry) * TEXT_CACHE))) 
-			return FALSE;
-		BZERO(tc->cache, sizeof(struct text_cache_entry) * TEXT_CACHE);
-		tc->index = 0;
-		tc->entries = TEXT_CACHE;
-	}
-
-	if (value) {
-		for (i = 0; i < tc->entries; i++) {
-			if (tc->cache[i].vaddr == vaddr)
-				return TRUE;
-		}
-
-		i = tc->index;
-		tc->cache[i].vaddr = vaddr;
-		tc->cache[i].value = value;
-		tc->index++;
-		if (tc->index == MAX_TEXT_CACHE) {
-			tc->index = 0;
-		} else if (tc->index == tc->entries) {
-			struct text_cache_entry *old_cache;
-
-			old_cache = tc->cache;
-			if ((tc->cache = (struct text_cache_entry *)
-                    	    realloc(old_cache, sizeof(struct text_cache_entry) *
-			    (TEXT_CACHE+tc->entries)))) {
-				BZERO(&tc->cache[tc->index], 
-				    sizeof(struct text_cache_entry) * 
-				    TEXT_CACHE);
-				tc->entries += TEXT_CACHE;
-			} else {
-				tc->cache = old_cache;
-				tc->index = 0;
-			} 
-		}
-		return TRUE;
-	}
-
-	if (valptr) {
-		tc->refs++;
-
-		for (i = 0; i < tc->entries; i++) {
-			if (!tc->cache[i].vaddr)
-				return FALSE;
-
-			if (tc->cache[i].vaddr == vaddr) {
-				*valptr = tc->cache[i].value;
-				tc->hits++;
-				return TRUE;
-			}
-		}
-	}
-
-	return FALSE;
-}
-
-/*
- *  The gdb disassembler reads text memory byte-by-byte, so this routine
- *  acts as a front-end to the 32-bit (4-byte) text storage.
- */
-
-int
-text_value_cache_byte(ulong vaddr, unsigned char *valptr)
-{
-        int i;
-	int shift;
-        struct text_cache *tc;
-	ulong valtmp;
-
-        if (!is_kernel_text(vaddr))
-                return FALSE;
-
-        tc = &text_cache;
-
-        tc->refs++;
-
-        for (i = 0; i < tc->entries; i++) {
-                if (!tc->cache[i].vaddr)
-                        return FALSE;
-
-                if ((vaddr >= tc->cache[i].vaddr) &&
-		    (vaddr < (tc->cache[i].vaddr+SIZEOF_32BIT))) {
-                        valtmp = tc->cache[i].value;
-			shift = (vaddr - tc->cache[i].vaddr) * 8;
-			valtmp >>= shift;
-			*valptr = valtmp & 0xff;
-                        tc->hits++;
-                        return TRUE;
-                }
-        }
-        return FALSE;
-}
-
-void
-dump_text_value_cache(int verbose)
-{
-	int i;
-	struct syment *sp;
-	ulong offset;
-	struct text_cache *tc;
-
-	tc = &text_cache;
-
-	if (!verbose) {
-		if (!tc->refs || !tc->cache) 
-			return;
-
-		fprintf(stderr, "     text hit rate: %2ld%% (%ld of %ld)\n",
-			(tc->hits * 100)/tc->refs, 
-			(ulong)tc->hits, (ulong)tc->refs);
-		return;
-	}
-		
-	for (i = 0; tc->cache && (i < tc->entries); i++) {
-		if (!tc->cache[i].vaddr)
-			break;
-		fprintf(fp, "[%2d]: %lx %08x ", i, tc->cache[i].vaddr,
-			tc->cache[i].value);
-		if ((sp = value_search(tc->cache[i].vaddr, &offset))) {
-			fprintf(fp, "(%s+", sp->name);
-			switch (pc->output_radix)
-			{
-			case 10:
-				fprintf(fp, "%ld)", offset);
-				break;
-			case 16:
-				fprintf(fp, "%lx)", offset);
-				break;
-			}
-		}
-		fprintf(fp, "\n");
-	}
-
-	fprintf(fp, 
-	    "text_cache entries: %d index: %d hit rate: %ld%% (%ld of %ld)\n", 
-		tc->entries, tc->index, 
-		(tc->hits * 100)/(tc->refs ? tc->refs : 1),
-		tc->hits, tc->refs);
-
-}
-
-void
-clear_text_value_cache(void)
-{
-        int i;
-        struct text_cache *tc;
-
-        tc = &text_cache;
-	tc->index = 0;
-
-        for (i = 0; tc->cache && (i < tc->entries); i++) {
-                tc->cache[i].vaddr = 0;
-                tc->cache[i].value = 0;
-	}
 }
 
 /*

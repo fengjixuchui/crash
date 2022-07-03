@@ -17,6 +17,7 @@
 # GNU General Public License for more details.
 #
 
+MAKEFLAGS += --no-print-directory
 PROGRAM=crash
 
 #
@@ -61,8 +62,9 @@ VMWARE_HFILES=vmware_vmss.h
 
 CFILES=main.c tools.c global_data.c memory.c filesys.c help.c task.c \
 	kernel.c test.c gdb_interface.c configure.c net.c dev.c bpf.c \
+	printk.c \
 	alpha.c x86.c ppc.c ia64.c s390.c s390x.c s390dbf.c ppc64.c x86_64.c \
-	arm.c arm64.c mips.c sparc64.c \
+	arm.c arm64.c mips.c mips64.c sparc64.c \
 	extensions.c remote.c va_server.c va_server_v1.c symbols.c cmdline.c \
 	lkcd_common.c lkcd_v1.c lkcd_v2_v3.c lkcd_v5.c lkcd_v7.c lkcd_v8.c\
 	lkcd_fix_mem.c s390_dump.c lkcd_x86_trace.c \
@@ -70,8 +72,8 @@ CFILES=main.c tools.c global_data.c memory.c filesys.c help.c task.c \
 	unwind_x86_32_64.c unwind_arm.c \
 	xen_hyper.c xen_hyper_command.c xen_hyper_global_data.c \
 	xen_hyper_dump_tables.c kvmdump.c qemu.c qemu-load.c sadump.c ipcs.c \
-	ramdump.c vmware_vmss.c \
-	xen_dom0.c kaslr_helper.c
+	ramdump.c vmware_vmss.c vmware_guestdump.c \
+	xen_dom0.c kaslr_helper.c sbitmap.c
 
 SOURCE_FILES=${CFILES} ${GENERIC_HFILES} ${MCORE_HFILES} \
 	${REDHAT_CFILES} ${REDHAT_HFILES} ${UNWIND_HFILES} \
@@ -80,8 +82,9 @@ SOURCE_FILES=${CFILES} ${GENERIC_HFILES} ${MCORE_HFILES} \
 
 OBJECT_FILES=main.o tools.o global_data.o memory.o filesys.o help.o task.o \
 	build_data.o kernel.o test.o gdb_interface.o net.o dev.o bpf.o \
+	printk.o \
 	alpha.o x86.o ppc.o ia64.o s390.o s390x.o s390dbf.o ppc64.o x86_64.o \
-	arm.o arm64.o mips.o sparc64.o \
+	arm.o arm64.o mips.o mips64.o sparc64.o \
 	extensions.o remote.o va_server.o va_server_v1.o symbols.o cmdline.o \
 	lkcd_common.o lkcd_v1.o lkcd_v2_v3.o lkcd_v5.o lkcd_v7.o lkcd_v8.o \
 	lkcd_fix_mem.o s390_dump.o netdump.o diskdump.o makedumpfile.o xendump.o \
@@ -89,8 +92,8 @@ OBJECT_FILES=main.o tools.o global_data.o memory.o filesys.o help.o task.o \
 	unwind_x86_32_64.o unwind_arm.o \
 	xen_hyper.o xen_hyper_command.o xen_hyper_global_data.o \
 	xen_hyper_dump_tables.o kvmdump.o qemu.o qemu-load.o sadump.o ipcs.o \
-	ramdump.o vmware_vmss.o \
-	xen_dom0.o kaslr_helper.o
+	ramdump.o vmware_vmss.o vmware_guestdump.o \
+	xen_dom0.o kaslr_helper.o sbitmap.o
 
 MEMORY_DRIVER_FILES=memory_driver/Makefile memory_driver/crash.c memory_driver/README
 
@@ -180,6 +183,9 @@ GDB_7.3.1_OFILES=${GDB}/gdb/symtab.o
 GDB_7.6_FILES=
 GDB_7.6_OFILES=${GDB}/gdb/symtab.o
 
+GDB_10.2_FILES=
+GDB_10.2_OFILES=${GDB}/gdb/symtab.o crash_target.o
+
 # 
 # GDB_FLAGS is passed up from the gdb Makefile.
 #
@@ -205,7 +211,7 @@ TAR_FILES=${SOURCE_FILES} Makefile ${GPL_FILES} README .rh_rpm_package crash.8 \
 	${EXTENSION_SOURCE_FILES} ${MEMORY_DRIVER_FILES}
 CSCOPE_FILES=${SOURCE_FILES}
 
-READLINE_DIRECTORY=./${GDB}/readline
+READLINE_DIRECTORY=./${GDB}/readline/readline
 BFD_DIRECTORY=./${GDB}/bfd
 GDB_INCLUDE_DIRECTORY=./${GDB}/include
 
@@ -217,25 +223,47 @@ ifneq ($(target),)
 CONF_TARGET_FLAG="-t$(target)"
 endif
 
+ifeq ($(findstring warn,$(MAKECMDGOALS)),warn)
+CONF_TARGET_FLAG += -w
+endif
+ifeq ($(findstring Warn,$(MAKECMDGOALS)),Warn)
+CONF_TARGET_FLAG += -W
+endif
+ifeq ($(findstring nowarn,$(MAKECMDGOALS)),nowarn)
+CONF_TARGET_FLAG += -n
+endif
+ifeq ($(findstring lzo,$(MAKECMDGOALS)),lzo)
+CONF_TARGET_FLAG += -x lzo
+endif
+ifeq ($(findstring snappy,$(MAKECMDGOALS)),snappy)
+CONF_TARGET_FLAG += -x snappy
+endif
+ifeq ($(findstring zstd,$(MAKECMDGOALS)),zstd)
+CONF_TARGET_FLAG += -x zstd
+endif
+ifeq ($(findstring valgrind,$(MAKECMDGOALS)),valgrind)
+CONF_TARGET_FLAG += -x valgrind
+endif
+
 # To build the extensions library by default, uncomment the third command
 # line below.  Otherwise they can be built by entering "make extensions".
 
 all: make_configure
 	@./configure ${CONF_TARGET_FLAG} -p "RPMPKG=${RPMPKG}" -b
-	@make --no-print-directory gdb_merge
-#	@make --no-print-directory extensions
+	@$(MAKE) gdb_merge
+#	@$(MAKE) extensions
 
 gdb_merge: force
 	@if [ ! -f ${GDB}/README ]; then \
-	  make --no-print-directory gdb_unzip; fi
+	  $(MAKE) gdb_unzip; fi
 	@echo "${LDFLAGS} -lz -ldl -rdynamic" > ${GDB}/gdb/mergelibs
 	@echo "../../${PROGRAM} ../../${PROGRAM}lib.a" > ${GDB}/gdb/mergeobj
 	@rm -f ${PROGRAM}
 	@if [ ! -f ${GDB}/config.status ]; then \
 	  (cd ${GDB}; ./configure ${GDB_CONF_FLAGS} --with-separate-debug-dir=/usr/lib/debug \
 	    --with-bugurl="" --with-expat=no --with-python=no --disable-sim; \
-	  make --no-print-directory CRASH_TARGET=${TARGET}; echo ${TARGET} > crash.target) \
-	else make --no-print-directory rebuild; fi
+	  $(MAKE) CRASH_TARGET=${TARGET}; echo ${TARGET} > crash.target) \
+	else $(MAKE) rebuild; fi
 	@if [ ! -f ${PROGRAM} ]; then \
 	  echo; echo "${PROGRAM} build failed"; \
 	  echo; exit 1; fi
@@ -246,8 +274,8 @@ rebuild:
 	@if [ -f ${GDB}.patch ] && [ -s ${GDB}.patch ] && \
 	  [ "`sum ${GDB}.patch`" != "`sum ${GDB}/${GDB}.patch`" ]; then \
 	  (sh -x ${GDB}.patch ${TARGET}; patch -N -p0 -r- --fuzz=0 < ${GDB}.patch; cp ${GDB}.patch ${GDB}; cd ${GDB}; \
-	  make --no-print-directory CRASH_TARGET=${TARGET}) \
-	else (cd ${GDB}/gdb; make --no-print-directory CRASH_TARGET=${TARGET}); fi
+	  $(MAKE) CRASH_TARGET=${TARGET}) \
+	else (cd ${GDB}/gdb; $(MAKE) CRASH_TARGET=${TARGET}); fi
 
 gdb_unzip:
 	@rm -f gdb.files
@@ -256,32 +284,21 @@ gdb_unzip:
 	@if [ ! -f ${GDB}.tar.gz ] && [ ! -f /usr/bin/wget ]; then \
 	  echo /usr/bin/wget is required to download ${GDB}.tar.gz; echo; exit 1; fi
 	@if [ ! -f ${GDB}.tar.gz ] && [ -f /usr/bin/wget ]; then \
-	  wget http://ftp.gnu.org/gnu/gdb/${GDB}.tar.gz; fi
-	@tar --exclude-from gdb.files -xvzmf ${GDB}.tar.gz
-	@make --no-print-directory gdb_patch
+	  [ ! -t 2 ] && WGET_OPTS="--progress=dot:mega"; \
+	  wget $$WGET_OPTS http://ftp.gnu.org/gnu/gdb/${GDB}.tar.gz; fi
+	@tar --exclude-from gdb.files -xzmf ${GDB}.tar.gz
+	@$(MAKE) gdb_patch
 
 gdb_patch:
 	if [ -f ${GDB}.patch ] && [ -s ${GDB}.patch ]; then \
 		patch -p0 < ${GDB}.patch; cp ${GDB}.patch ${GDB}; fi
-	if [ "${ARCH}" = "ppc64le" ] && [ -f ${GDB}-ppc64le-support.patch ]; then \
-		patch -d ${GDB} -p1 -F0 < ${GDB}-ppc64le-support.patch ; \
-	fi
-	if [ "${ARCH}" = "x86_64" ] && [ "${TARGET}" = "PPC64" ] && [ -f ${GDB}-ppc64le-support.patch ]; then \
-		patch -d ${GDB} -p1 -F0 < ${GDB}-ppc64le-support.patch ; \
-	fi
-	if [ -f /usr/include/proc_service.h ]; then \
-		grep 'extern ps_err_e ps_get_thread_area (struct' /usr/include/proc_service.h; \
-		if [ $$? -eq 0 ]; then \
-			patch -p0 < ${GDB}-proc_service.h.patch; \
-		fi; \
-	fi
 
-library: make_build_data ${OBJECT_FILES}
+library: ${OBJECT_FILES}
 	ar -rs ${PROGRAM}lib.a ${OBJECT_FILES}
 
 gdb: force
 	rm -f ${GDB_OFILES}
-	@make --no-print-directory all
+	@$(MAKE) all
 
 force:
 	
@@ -292,42 +309,26 @@ make_configure: force
 
 clean: make_configure
 	@./configure ${CONF_TARGET_FLAG} -q -b
-	@make --no-print-directory do_clean
+	@$(MAKE) do_clean
 
 do_clean:
 	rm -f ${OBJECT_FILES} ${DAEMON_OBJECT_FILES} ${PROGRAM} ${PROGRAM}lib.a ${GDB_OFILES}
-	@(cd extensions; make --no-print-directory -i clean)
-	@(cd memory_driver; make --no-print-directory -i clean)
+	@$(MAKE) -C extensions -i clean
+	@$(MAKE) -C memory_driver -i clean
 
-make_build_data: force
+build_data.o: force
 	${CC} -c ${CRASH_CFLAGS} build_data.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 install:
+	/usr/bin/install -d ${INSTALLDIR}
 	/usr/bin/install ${PROGRAM} ${INSTALLDIR}
 #	/usr/bin/install ${PROGRAM}d ${INSTALLDIR}
 
 unconfig: make_configure
 	@./configure -u
 
-warn: make_configure
-	@./configure ${CONF_TARGET_FLAG} -w -b
-	@make --no-print-directory gdb_merge
-
-Warn: make_configure
-	@./configure ${CONF_TARGET_FLAG} -W -b
-	@make --no-print-directory gdb_merge
-
-nowarn: make_configure
-	@./configure ${CONF_TARGET_FLAG} -n -b
-	@make --no-print-directory gdb_merge
-
-lzo: make_configure
-	@./configure -x lzo ${CONF_TARGET_FLAG} -w -b
-	@make --no-print-directory gdb_merge
-
-snappy: make_configure
-	@./configure -x snappy ${CONF_TARGET_FLAG} -w -b
-	@make --no-print-directory gdb_merge
+warn Warn nowarn lzo snappy zstd valgrind: all
+	@true  #dummy
 
 main.o: ${GENERIC_HFILES} main.c
 	${CC} -c ${CRASH_CFLAGS} main.c ${WARNING_OPTIONS} ${WARNING_ERROR} 
@@ -337,6 +338,9 @@ cmdline.o: ${GENERIC_HFILES} cmdline.c
 
 tools.o: ${GENERIC_HFILES} tools.c
 	${CC} -c ${CRASH_CFLAGS} tools.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+sbitmap.o: ${GENERIC_HFILES} sbitmap.c
+	${CC} -c ${CRASH_CFLAGS} sbitmap.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 global_data.o: ${GENERIC_HFILES} global_data.c
 	${CC} -c ${CRASH_CFLAGS} global_data.c ${WARNING_OPTIONS} ${WARNING_ERROR}
@@ -360,7 +364,10 @@ task.o: ${GENERIC_HFILES} task.c
 	${CC} -c ${CRASH_CFLAGS} task.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 kernel.o: ${GENERIC_HFILES} kernel.c
-	${CC} -c ${CRASH_CFLAGS} kernel.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+	${CC} -c ${CRASH_CFLAGS} kernel.c -I${BFD_DIRECTORY} -I${GDB_INCLUDE_DIRECTORY} ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+printk.o: ${GENERIC_HFILES} printk.c
+	${CC} -c ${CRASH_CFLAGS} printk.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 gdb_interface.o: ${GENERIC_HFILES} gdb_interface.c
 	${CC} -c ${CRASH_CFLAGS} gdb_interface.c ${WARNING_OPTIONS} ${WARNING_ERROR}
@@ -427,6 +434,9 @@ arm64.o: ${GENERIC_HFILES} ${REDHAT_HFILES} arm64.c
 
 mips.o: ${GENERIC_HFILES} ${REDHAT_HFILES} mips.c
 	${CC} -c ${CRASH_CFLAGS} mips.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+mips64.o: ${GENERIC_HFILES} ${REDHAT_HFILES} mips64.c
+	${CC} -c ${CRASH_CFLAGS} mips64.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 sparc64.o: ${GENERIC_HFILES} ${REDHAT_HFILES} sparc64.c
 	${CC} -c ${CRASH_CFLAGS} sparc64.c ${WARNING_OPTIONS} ${WARNING_ERROR}
@@ -517,6 +527,9 @@ ramdump.o: ${GENERIC_HFILES} ${REDHAT_HFILES} ramdump.c
 vmware_vmss.o: ${GENERIC_HFILES} ${VMWARE_HFILES} vmware_vmss.c
 	${CC} -c ${CRASH_CFLAGS} vmware_vmss.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
+vmware_guestdump.o: ${GENERIC_HFILES} ${VMWARE_HFILES} vmware_guestdump.c
+	${CC} -c ${CRASH_CFLAGS} vmware_guestdump.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
 kaslr_helper.o: ${GENERIC_HFILES} kaslr_helper.c
 	${CC} -c ${CRASH_CFLAGS} kaslr_helper.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
@@ -524,7 +537,7 @@ bpf.o: ${GENERIC_HFILES} bpf.c
 	${CC} -c ${CRASH_CFLAGS} bpf.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 ${PROGRAM}: force
-	@make --no-print-directory all
+	@$(MAKE) all
 
 # Remote daemon functionality has been deprecated.
 daemon_deprecated: force
@@ -533,15 +546,15 @@ daemon_deprecated: force
 
 ${PROGRAM}d: daemon_deprecated make_configure
 	@./configure -d
-	@make --no-print-directory make_build_data
-	@make --no-print-directory daemon 
+	@$(MAKE) build_data.o
+	@$(MAKE) daemon
 
 daemon: ${DAEMON_OBJECT_FILES}
 	${CC} ${LDFLAGS} -o ${PROGRAM}d ${DAEMON_OBJECT_FILES} build_data.o -lz 
 
 files: make_configure
 	@./configure -q -b
-	@make --no-print-directory show_files
+	@$(MAKE) show_files
 
 gdb_files: make_configure
 	@./configure -q -b
@@ -558,7 +571,7 @@ ctags:
 
 tar: make_configure
 	@./configure -q -b
-	@make --no-print-directory do_tar
+	@$(MAKE) do_tar
 
 do_tar:
 	@if [ -f ${PROGRAM}  ]; then \
@@ -573,7 +586,7 @@ release: make_configure
 	@if [ "`id --user`" != "0" ]; then \
 		echo "make release: must be super-user"; exit 1; fi
 	@./configure -P "RPMPKG=${RPMPKG}" -u -g
-	@make --no-print-directory release_configure
+	@$(MAKE) release_configure
 	@echo 
 	@echo "cvs tag this release if necessary"
 
@@ -581,7 +594,7 @@ release_configure: make_configure
 	@if [ "${GDB}" = "" ] ; then \
 		echo "make release: GDB not defined: append GDB=gdb-x.x to make command line"; echo; exit 1; fi 
 	@./configure -r ${GDB}
-	@make --no-print-directory do_release
+	@$(MAKE) do_release
 
 do_release:
 	@echo "CRASH VERSION: ${VERSION}  GDB VERSION: ${GDB}"
@@ -623,13 +636,13 @@ do_release:
 	fi
 
 ref:
-	make ctags cscope
+	$(MAKE) ctags cscope
 
 cscope:
-	rm -f cscope.files cscope_out
+	rm -f cscope.files cscope.out
 	for FILE in ${SOURCE_FILES}; do \
 	echo $$FILE >> cscope.files; done
-	cscope
+	cscope -b -f cscope.out
 
 glink: make_configure
 	@./configure -q -b
@@ -645,10 +658,10 @@ dis:
 
 extensions: make_configure
 	@./configure ${CONF_TARGET_FLAG} -q -b
-	@make --no-print-directory do_extensions
+	@$(MAKE) do_extensions
 
 do_extensions:
-	@(cd extensions; make -i TARGET=$(TARGET) TARGET_CFLAGS="$(TARGET_CFLAGS)" GDB=$(GDB) GDB_FLAGS=$(GDB_FLAGS))
+	@$(MAKE) -C extensions -i TARGET=$(TARGET) TARGET_CFLAGS="$(TARGET_CFLAGS)" GDB=$(GDB) GDB_FLAGS=$(GDB_FLAGS)
 
 memory_driver: make_configure 
-	@(cd memory_driver; make --no-print-directory -i)
+	@$(MAKE) -C memory_driver -i

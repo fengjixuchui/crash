@@ -63,6 +63,64 @@ static int do_old_idr(int, ulong, struct list_pair *);
 #define PROG_VERBOSE  (0x40)
 #define MAP_VERBOSE   (0x80)
 
+static int map_is_per_cpu(int type)
+{
+
+/* See the definition of bpf_map_type: include/uapi/linux/bpf.h */
+#define BPF_MAP_TYPE_PERCPU_HASH (5UL)
+#define BPF_MAP_TYPE_PERCPU_ARRAY (6UL)
+#define BPF_MAP_TYPE_LRU_PERCPU_HASH (10UL)
+#define BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE (21UL)
+
+	return type == BPF_MAP_TYPE_PERCPU_HASH ||
+	       type == BPF_MAP_TYPE_PERCPU_ARRAY ||
+	       type == BPF_MAP_TYPE_LRU_PERCPU_HASH ||
+	       type == BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE;
+}
+
+static int map_is_fd_map(int type)
+{
+
+/* See the definition of bpf_map_type: include/uapi/linux/bpf.h */
+#define BPF_MAP_TYPE_PROG_ARRAY (3UL)
+#define BPF_MAP_TYPE_PERF_EVENT_ARRAY (4UL)
+#define BPF_MAP_TYPE_CGROUP_ARRAY (8UL)
+#define BPF_MAP_TYPE_ARRAY_OF_MAPS (12UL)
+#define BPF_MAP_TYPE_HASH_OF_MAPS (13UL)
+
+	return type == BPF_MAP_TYPE_PROG_ARRAY ||
+	       type == BPF_MAP_TYPE_PERF_EVENT_ARRAY ||
+	       type == BPF_MAP_TYPE_CGROUP_ARRAY ||
+	       type == BPF_MAP_TYPE_ARRAY_OF_MAPS ||
+	       type == BPF_MAP_TYPE_HASH_OF_MAPS;
+
+}
+
+static ulong bpf_map_memory_size(int map_type, uint value_size,
+				uint key_size, uint max_entries)
+{
+	ulong size;
+	uint valsize;
+	int cpus = 0;
+
+	if (map_is_per_cpu(map_type)) {
+		cpus = get_cpus_possible();
+		if (!cpus) {
+			error(WARNING, "cpu_possible_map does not exist, possible cpus: %d\n", cpus);
+			return 0;
+		}
+
+		valsize = roundup(value_size, 8) * cpus;
+	} else if (map_is_fd_map(map_type))
+		valsize = sizeof(uint);
+	else
+		valsize = value_size;
+
+	size = roundup((key_size + valsize), 8);
+
+	return roundup((max_entries * size), PAGESIZE());
+}
+
 void
 cmd_bpf(void)
 {
@@ -194,6 +252,7 @@ bpf_init(struct bpf_info *bpf)
 		MEMBER_OFFSET_INIT(bpf_prog_pages, "bpf_prog", "pages");
 		MEMBER_OFFSET_INIT(bpf_prog_aux_load_time, "bpf_prog_aux", "load_time");
 		MEMBER_OFFSET_INIT(bpf_prog_aux_user, "bpf_prog_aux", "user");
+		MEMBER_OFFSET_INIT(bpf_prog_aux_name, "bpf_prog_aux", "name");
 		MEMBER_OFFSET_INIT(bpf_map_key_size, "bpf_map", "key_size");
 		MEMBER_OFFSET_INIT(bpf_map_value_size, "bpf_map", "value_size");
 		MEMBER_OFFSET_INIT(bpf_map_max_entries, "bpf_map", "max_entries");
@@ -201,6 +260,13 @@ bpf_init(struct bpf_info *bpf)
 		MEMBER_OFFSET_INIT(bpf_map_name, "bpf_map", "name");
 		MEMBER_OFFSET_INIT(bpf_map_user, "bpf_map", "user");
 		MEMBER_OFFSET_INIT(user_struct_uid, "user_struct", "uid");
+
+		/* Linux 5.3 */
+		MEMBER_OFFSET_INIT(bpf_map_memory, "bpf_map", "memory");
+		if (VALID_MEMBER(bpf_map_memory)) {
+			MEMBER_OFFSET_INIT(bpf_map_memory_pages, "bpf_map_memory", "pages");
+			MEMBER_OFFSET_INIT(bpf_map_memory_user, "bpf_map_memory", "user");
+		}
 
 		if (!bpf_type_size_init()) {
 			bpf->status = FALSE;
@@ -324,7 +390,7 @@ do_bpf(ulong flags, ulong prog_id, ulong map_id, int radix)
 {
 	struct bpf_info *bpf;
 	int i, c, found, entries, type;
-	uint uid, map_pages, key_size, value_size, max_entries;
+	uint uid, map_pages, key_size = 0, value_size = 0, max_entries = 0;
 	ulong bpf_prog_aux, bpf_func, end_func, addr, insnsi, user;
 	ulong do_progs, do_maps;
 	ulonglong load_time;
@@ -445,6 +511,17 @@ do_bpf(ulong flags, ulong prog_id, ulong map_id, int radix)
 			bpf_prog_gpl_compatible(buf1, (ulong)bpf->proglist[i].value);
 			fprintf(fp, "     GPL_COMPATIBLE: %s", buf1);
 
+			fprintf(fp, "  NAME: ");
+			if (VALID_MEMBER(bpf_prog_aux_name)) {
+				BCOPY(&bpf->bpf_prog_aux_buf[OFFSET(bpf_prog_aux_name)], buf1, 16);
+				buf1[16] = NULLCHAR;
+				if (strlen(buf1))
+					fprintf(fp, "\"%s\"", buf1);
+				else
+					fprintf(fp, "(unused)");
+			} else
+				fprintf(fp, "(unknown)");
+
 			fprintf(fp, "  UID: ");
 			if (VALID_MEMBER(bpf_prog_aux_user) && VALID_MEMBER(user_struct_uid)) {
 				user = ULONG(bpf->bpf_prog_aux_buf + OFFSET(bpf_prog_aux_user));
@@ -553,6 +630,8 @@ do_map_only:
 		fprintf(fp, "\n");
 
 		if (flags & (MAP_ID|MAP_VERBOSE)) {
+			ulong msize = 0;
+
 			fprintf(fp, "     KEY_SIZE: ");
 			if (VALID_MEMBER(bpf_map_key_size)) {
 				key_size = UINT(bpf->bpf_map_buf + OFFSET(bpf_map_key_size));
@@ -576,11 +655,17 @@ do_map_only:
 				fprintf(fp, "(unknown)");
 
 			fprintf(fp, "  MEMLOCK: ");
-			if (VALID_MEMBER(bpf_map_pages)) {
+			if (VALID_MEMBER(bpf_map_memory) && VALID_MEMBER(bpf_map_memory_pages)) {
+				map_pages = UINT(bpf->bpf_map_buf + OFFSET(bpf_map_memory)
+						+ OFFSET(bpf_map_memory_pages));
+				fprintf(fp, "%d\n", map_pages * PAGESIZE());
+			} else if (VALID_MEMBER(bpf_map_pages)) {
 				map_pages = UINT(bpf->bpf_map_buf + OFFSET(bpf_map_pages));
 				fprintf(fp, "%d\n", map_pages * PAGESIZE());
-			} else
-				fprintf(fp, "(unknown)\n");
+			} else if ((msize = bpf_map_memory_size(type, value_size, key_size, max_entries)))
+				fprintf(fp, "%ld\n", msize);
+			else
+				fprintf(fp, "(unknown)");
 
 			fprintf(fp, "     NAME: ");
 			if (VALID_MEMBER(bpf_map_name)) {
@@ -594,15 +679,22 @@ do_map_only:
 				fprintf(fp, "(unknown)\n");
 
 			fprintf(fp, "  UID: ");
-			if (VALID_MEMBER(bpf_map_user) && VALID_MEMBER(user_struct_uid)) {
+			if (VALID_MEMBER(bpf_map_memory) && VALID_MEMBER(bpf_map_memory_user))
+				user = ULONG(bpf->bpf_map_buf + OFFSET(bpf_map_memory)
+						+ OFFSET(bpf_map_memory_user));
+			else if (VALID_MEMBER(bpf_map_user))
 				user = ULONG(bpf->bpf_map_buf + OFFSET(bpf_map_user));
+			else
+				user = 0;
+
+			if (user && VALID_MEMBER(user_struct_uid)) {
 				if (readmem(user + OFFSET(user_struct_uid), KVADDR, &uid, sizeof(uint), 
 				    "user_struct.uid", QUIET|RETURN_ON_ERROR))
 					fprintf(fp, "%d\n", uid);
 				else
 					fprintf(fp, "(unknown)\n");
 			} else
-				fprintf(fp, "(unknown)\n");
+				fprintf(fp, "(unused)\n");
 		}
 
 		if (flags & DUMP_STRUCT) {

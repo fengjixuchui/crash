@@ -24,7 +24,6 @@ ifeq ($(TARGET), X86)
 endif
 
 APPFILE=eppic/applications/crash/eppic.c
-GITHUB := $(shell ping -c 1 github.com | grep "1 received")
 GIT := $(shell which git 2> /dev/null)
 
 all:
@@ -36,10 +35,10 @@ all:
           if [ -f "$(GIT)" ]; \
           then \
              if [ -n "$(EPPIC_GIT_URL)" ]; then \
-               git clone "$(EPPIC_GIT_URL)" eppic; \
+               git clone $(EPPIC_GIT_OPTIONS) $(EPPIC_GIT_URL) eppic; \
              else \
-	          if [ -n "$(GITHUB)" ] ; then \
-		    git clone https://github.com/lucchouina/eppic.git eppic; \
+	          if ping -c 1 -W 5 github.com >/dev/null ; then \
+		    git clone $(EPPIC_GIT_OPTIONS) https://github.com/lucchouina/eppic.git eppic; \
 	          fi; \
              fi; \
           else \

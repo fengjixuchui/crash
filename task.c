@@ -48,6 +48,9 @@ static void show_tgid_list(ulong);
 static int compare_start_time(const void *, const void *);
 static int start_time_timespec(void);
 static ulonglong convert_start_time(ulonglong, ulonglong);
+static ulong search_panic_task_by_cpu(char *);
+static ulong search_panic_task_by_keywords(char *, int *);
+static ulong get_log_panic_task(void);
 static ulong get_dumpfile_panic_task(void);
 static ulong get_active_set_panic_task(void);
 static void populate_panic_threads(void);
@@ -130,6 +133,23 @@ static struct sched_policy_info {
 	{ SCHED_IDLE,		"IDLE" },
 	{ SCHED_DEADLINE,	"DEADLINE" },
 	{ ULONG_MAX,		NULL }
+};
+
+enum PANIC_TASK_FOUND_RESULT {
+	FOUND_NO_PANIC_KEYWORD,
+	FOUND_PANIC_KEYWORD,
+	FOUND_PANIC_TASK
+};
+
+const char *panic_keywords[] = {
+	"Unable to handle kernel",
+	"BUG: unable to handle kernel",
+	"Kernel BUG at",
+	"kernel BUG at",
+	"Bad mode in",
+	"Oops",
+	"Kernel panic",
+	NULL,
 };
 
 /*
@@ -258,8 +278,10 @@ task_init(void)
 	} else if (VALID_MEMBER(task_struct_stack))
 		MEMBER_OFFSET_INIT(task_struct_thread_info, "task_struct", "stack");
 
+	MEMBER_OFFSET_INIT(task_struct_cpu, "task_struct", "cpu");
+
 	if (VALID_MEMBER(task_struct_thread_info)) {
-		if (tt->flags & THREAD_INFO_IN_TASK) {
+		if (tt->flags & THREAD_INFO_IN_TASK && VALID_MEMBER(task_struct_cpu)) {
 			MEMBER_OFFSET_INIT(thread_info_flags, "thread_info", "flags");
 			/* (unnecessary) reminders */
 			ASSIGN_OFFSET(thread_info_task) = INVALID_OFFSET;
@@ -277,6 +299,11 @@ task_init(void)
 	}
 
         MEMBER_OFFSET_INIT(task_struct_state, "task_struct", "state");
+	MEMBER_SIZE_INIT(task_struct_state, "task_struct", "state");
+	if (INVALID_MEMBER(task_struct_state)) {
+		MEMBER_OFFSET_INIT(task_struct_state, "task_struct", "__state");
+		MEMBER_SIZE_INIT(task_struct_state, "task_struct", "__state");
+	}
         MEMBER_OFFSET_INIT(task_struct_exit_state, "task_struct", "exit_state");
         MEMBER_OFFSET_INIT(task_struct_pid, "task_struct", "pid");
         MEMBER_OFFSET_INIT(task_struct_comm, "task_struct", "comm");
@@ -290,7 +317,6 @@ task_init(void)
         MEMBER_OFFSET_INIT(task_struct_has_cpu, "task_struct", "has_cpu");
         MEMBER_OFFSET_INIT(task_struct_cpus_runnable,  
 		"task_struct", "cpus_runnable");
-	MEMBER_OFFSET_INIT(task_struct_cpu, "task_struct", "cpu");
 	MEMBER_OFFSET_INIT(task_struct_active_mm, "task_struct", "active_mm");
 	MEMBER_OFFSET_INIT(task_struct_next_run, "task_struct", "next_run");
 	MEMBER_OFFSET_INIT(task_struct_flags, "task_struct", "flags");
@@ -397,7 +423,8 @@ task_init(void)
 
 	STRUCT_SIZE_INIT(cputime_t, "cputime_t");
 
-	if (symbol_exists("cfq_slice_async")) {
+	if ((THIS_KERNEL_VERSION < LINUX(4,8,0)) &&
+	    symbol_exists("cfq_slice_async")) {
 		uint cfq_slice_async;
 
 		get_symbol_data("cfq_slice_async", sizeof(int), 
@@ -411,6 +438,31 @@ task_init(void)
 			    	    "cfq_slice_async exists: setting hz to %d\n", 
 					machdep->hz);
 		}
+	} else if ((symbol_exists("dd_init_queue") &&
+	    gdb_set_crash_scope(symbol_value("dd_init_queue"), "dd_init_queue")) ||
+	    (symbol_exists("dd_init_sched") &&
+	    gdb_set_crash_scope(symbol_value("dd_init_sched"), "dd_init_sched")) ||
+	    (symbol_exists("deadline_init_queue") &&
+	    gdb_set_crash_scope(symbol_value("deadline_init_queue"), "deadline_init_queue"))) {
+		char buf[BUFSIZE];
+		uint write_expire = 0;
+
+		open_tmpfile();
+		sprintf(buf, "printf \"%%d\", write_expire");
+		if (gdb_pass_through(buf, pc->tmpfile, GNU_RETURN_ON_ERROR)) {
+			rewind(pc->tmpfile);
+			if (fgets(buf, BUFSIZE, pc->tmpfile))
+				sscanf(buf, "%d", &write_expire);
+		}
+		close_tmpfile();
+
+		if (write_expire) {
+			machdep->hz = write_expire / 5;
+			if (CRASHDEBUG(2))
+				fprintf(fp, "write_expire exists: setting hz to %d\n",
+					machdep->hz);
+		}
+		gdb_set_crash_scope(0, NULL);
 	}
 
 	if (VALID_MEMBER(runqueue_arrays)) 
@@ -640,6 +692,16 @@ task_init(void)
 
 	stack_overflow_check_init();
 
+	if (machdep->hz) {
+		ulonglong uptime_jiffies;
+		ulong  uptime_sec;
+
+		get_uptime(NULL, &uptime_jiffies);
+		uptime_sec = (uptime_jiffies)/(ulonglong)machdep->hz;
+		kt->boot_date.tv_sec = kt->date.tv_sec - uptime_sec;
+		kt->boot_date.tv_nsec = 0;
+	}
+
 	tt->flags |= TASK_INIT_DONE;
 }
 
@@ -693,6 +755,7 @@ irqstacks_init(void)
 	} else 
 		error(WARNING, "cannot determine hardirq_ctx addresses\n");
 
+	/* TODO: Use multithreading to parallely update irq_tasks. */
 	for (i = 0; i < NR_CPUS; i++) {
 		if (!(tt->hardirq_ctx[i]))
 			continue;
@@ -2850,7 +2913,7 @@ add_context(ulong task, char *tp)
 		else
 			tc->thread_info = ULONG(tp + OFFSET(task_struct_thread_info));
 		fill_thread_info(tc->thread_info);
-		if (tt->flags & THREAD_INFO_IN_TASK)
+		if (tt->flags & THREAD_INFO_IN_TASK && VALID_MEMBER(task_struct_cpu))
                 	processor_addr = (int *) (tp + OFFSET(task_struct_cpu));
 		else
 			processor_addr = (int *) (tt->thread_info + 
@@ -2884,6 +2947,7 @@ add_context(ulong task, char *tp)
 	tg = tt->tgid_array + tt->running_tasks;
 	tg->tgid = *tgid_addr;
 	tg->task = task;
+	tg->rss_cache = UNINITIALIZED;
 
         if (do_verify && !verify_task(tc, do_verify)) {
 		error(INFO, "invalid task address: %lx\n", tc->task);
@@ -3764,7 +3828,7 @@ show_ps_data(ulong flag, struct task_context *tc, struct psinfo *psi)
 	} else
 		fprintf(fp, "  ");
 
-	fprintf(fp, "%5ld  %5ld  %2s  %s %3s",
+	fprintf(fp, "%7ld %7ld %3s  %s %3s",
 		tc->pid, task_to_pid(tc->ptask),
 		task_cpu(tc->processor, buf2, !VERBOSE),
 		task_pointer_string(tc, flag & PS_KSTACKP, buf3),
@@ -3774,8 +3838,8 @@ show_ps_data(ulong flag, struct task_context *tc, struct psinfo *psi)
 	if (strlen(buf1) == 3)
 		mkstring(buf1, 4, CENTER|RJUST, NULL);
 	fprintf(fp, "%s ", buf1);
-	fprintf(fp, "%7ld ", (tm->total_vm * PAGESIZE())/1024);
-	fprintf(fp, "%6ld  ", (tm->rss * PAGESIZE())/1024);
+	fprintf(fp, "%8ld ", (tm->total_vm * PAGESIZE())/1024);
+	fprintf(fp, "%8ld  ", (tm->rss * PAGESIZE())/1024);
 	if (is_kernel_thread(tc->task))
 		fprintf(fp, "[%s]\n", tc->comm);
 	else
@@ -3792,7 +3856,7 @@ show_ps(ulong flag, struct psinfo *psi)
 
 	if (!(flag & ((PS_EXCLUSIVE & ~PS_ACTIVE)|PS_NO_HEADER))) 
 		fprintf(fp, 
-		    "   PID    PPID  CPU %s  ST  %%MEM     VSZ    RSS  COMM\n",
+		    "      PID    PPID  CPU %s  ST  %%MEM      VSZ      RSS  COMM\n",
 			flag & PS_KSTACKP ?
 			mkstring(buf, VADDR_PRLEN, CENTER|RJUST, "KSTACKP") :
 			mkstring(buf, VADDR_PRLEN, CENTER, "TASK"));
@@ -4599,8 +4663,6 @@ show_task_times(struct task_context *tcp, ulong flags)
 static int
 start_time_timespec(void)
 {
-        char buf[BUFSIZE];
-
 	switch(tt->flags & (TIMESPEC | NO_TIMESPEC | START_TIME_NSECS))
 	{
 	case TIMESPEC:
@@ -4614,24 +4676,11 @@ start_time_timespec(void)
 
 	tt->flags |= NO_TIMESPEC;
 
-        open_tmpfile();
-        sprintf(buf, "ptype struct task_struct");
-        if (!gdb_pass_through(buf, NULL, GNU_RETURN_ON_ERROR)) {
-                close_tmpfile();
-                return FALSE;
-        }
-
-        rewind(pc->tmpfile);
-        while (fgets(buf, BUFSIZE, pc->tmpfile)) {
-                if (strstr(buf, "start_time;")) {
-			if (strstr(buf, "struct timespec")) {
-				tt->flags &= ~NO_TIMESPEC;
-				tt->flags |= TIMESPEC;
-			}
-		}
-        }
-
-        close_tmpfile();
+	if (VALID_MEMBER(task_struct_start_time) &&
+	    STREQ(MEMBER_TYPE_NAME("task_struct", "start_time"), "timespec")) {
+			tt->flags &= ~NO_TIMESPEC;
+			tt->flags |= TIMESPEC;
+	}
 
 	if ((tt->flags & NO_TIMESPEC) && (SIZE(task_struct_start_time) == 8)) {
 		tt->flags &= ~NO_TIMESPEC;
@@ -4985,6 +5034,10 @@ pid_exists(ulong pid)
 /*
  *  Translate a stack pointer to a task, dealing with possible split.
  *  If that doesn't work, check the hardirq_stack and softirq_stack.
+ *
+ * TODO: This function can be optimized by getting min & max of the
+ *       stack range in first pass and use these values against the
+ *       given SP to decide whether or not to proceed with stack lookup.
  */
 ulong
 stkptr_to_task(ulong sp)
@@ -4992,6 +5045,9 @@ stkptr_to_task(ulong sp)
         int i, c;
         struct task_context *tc;
 	struct bt_info bt_info, *bt;
+
+	if (!sp)
+		return NO_TASK;
 
 	bt = &bt_info;
         tc = FIRST_CONTEXT();
@@ -5874,7 +5930,10 @@ task_state(ulong task)
 	if (!tt->last_task_read)
 		return 0;
 
-	state = ULONG(tt->task_struct + OFFSET(task_struct_state));
+	if (SIZE(task_struct_state) == sizeof(ulong))
+		state = ULONG(tt->task_struct + OFFSET(task_struct_state));
+	else
+		state = UINT(tt->task_struct + OFFSET(task_struct_state));
 	exit_state = VALID_MEMBER(task_struct_exit_state) ?
 		ULONG(tt->task_struct + OFFSET(task_struct_exit_state)) : 0;
 
@@ -6116,8 +6175,8 @@ get_panic_ksp(struct bt_info *bt, ulong *ksp)
 
 /*
  *  Look for kcore's storage information for the system's panic state.
- *  If it's not there (somebody else's dump format?), look through all the
- *  stack traces for evidence of panic. 
+ *  If it's not there (somebody else's dump format?), look through all
+ *  the stack traces or the log buffer for evidence of panic.
  */
 static ulong
 get_panic_context(void)
@@ -6317,6 +6376,13 @@ get_panicmsg(char *buf)
 	rewind(pc->tmpfile);
 	while (!msg_found && fgets(buf, BUFSIZE, pc->tmpfile)) {
 		if (strstr(buf, "[Hardware Error]: ")) {
+			msg_found = TRUE;
+			break;
+		}
+	}
+	rewind(pc->tmpfile);
+	while (!msg_found && fgets(buf, BUFSIZE, pc->tmpfile)) {
+		if (strstr(buf, "Bad mode in ")) {
 			msg_found = TRUE;
 			break;
 		}
@@ -7401,6 +7467,8 @@ panic_search(void)
 
 	close_tmpfile();
 
+	pc->curcmd = pc->program_name;
+
 	if (!found && (dietask > (NO_TASK+1)) && task_has_cpu(dietask, NULL)) {
 		lasttask = dietask;
 		found = TRUE;
@@ -7410,8 +7478,15 @@ panic_search(void)
 		error(WARNING, "multiple active tasks have called die\n\n");
 
 	if (CRASHDEBUG(1) && found)
-		error(INFO, "panic_search: %lx (via foreach bt)\n", 
+		error(INFO, "panic_search: %lx (via foreach bt)\n",
 			lasttask);
+
+	if (!found) {
+		if (CRASHDEBUG(1))
+			error(INFO, "panic_search: failed (via foreach bt)\n");
+		if ((lasttask = get_log_panic_task()))
+			found = TRUE;
+	}
 
 found_panic_task:
 	populate_panic_threads();
@@ -7430,9 +7505,112 @@ found_panic_task:
 	} 
 
 	if (CRASHDEBUG(1))
-		error(INFO, "panic_search: failed (via foreach bt)\n");
+		error(INFO, "panic_search: failed\n");
 
 	return NULL;
+}
+
+static ulong
+search_panic_task_by_cpu(char *buf)
+{
+	int crashing_cpu;
+	char *p1, *p2;
+	ulong task = NO_TASK;
+
+	p1 = NULL;
+
+	if ((p1 = strstr(buf, "CPU: ")))
+		p1 += strlen("CPU: ");
+	else if (STRNEQ(buf, "CPU "))
+		p1 = buf + strlen("CPU ");
+
+	if (p1) {
+		p2 = p1;
+		while (!whitespace(*p2) && (*p2 != '\n'))
+			p2++;
+		*p2 = NULLCHAR;
+		crashing_cpu = dtol(p1, RETURN_ON_ERROR, NULL);
+		if ((crashing_cpu >= 0) && in_cpu_map(ONLINE_MAP, crashing_cpu)) {
+			task = tt->active_set[crashing_cpu];
+			if (CRASHDEBUG(1))
+				error(WARNING,
+					"get_log_panic_task: active_set[%d]: %lx\n",
+					crashing_cpu, tt->active_set[crashing_cpu]);
+		}
+	}
+	return task;
+}
+
+static ulong
+search_panic_task_by_keywords(char *buf, int *found_flag)
+{
+	char *p;
+	int i = 0;
+	ulong task;
+
+	while (panic_keywords[i]) {
+		if ((p = strstr(buf, panic_keywords[i]))) {
+			if ((task = search_panic_task_by_cpu(p))) {
+				*found_flag = FOUND_PANIC_TASK;
+				return task;
+			} else {
+				*found_flag = FOUND_PANIC_KEYWORD;
+				return NO_TASK;
+			}
+		}
+		i++;
+	}
+	*found_flag = FOUND_NO_PANIC_KEYWORD;
+	return NO_TASK;
+}
+
+/*
+ *   Search for the panic task by seeking panic keywords from kernel log buffer.
+ *   The panic keyword is generally followed by printing out the stack trace info
+ *   of the panicking task.  We can determine the panic task by finding the first
+ *   instance of "CPU: " or "CPU " following the panic keywords.
+ */
+static ulong
+get_log_panic_task(void)
+{
+	int found_flag = FOUND_NO_PANIC_KEYWORD;
+	int found_panic_keyword = FALSE;
+	ulong task = NO_TASK;
+	char buf[BUFSIZE];
+
+	if (!get_active_set())
+		goto fail;
+
+	BZERO(buf, BUFSIZE);
+	open_tmpfile();
+	dump_log(SHOW_LOG_TEXT);
+	rewind(pc->tmpfile);
+	while (fgets(buf, BUFSIZE, pc->tmpfile)) {
+		if (!found_panic_keyword) {
+			task = search_panic_task_by_keywords(buf, &found_flag);
+			switch (found_flag) {
+				case FOUND_PANIC_TASK:
+					goto found_panic_task;
+				case FOUND_PANIC_KEYWORD:
+					found_panic_keyword = TRUE;
+					continue;
+				default:
+					continue;
+			}
+		} else {
+			task = search_panic_task_by_cpu(buf);
+			if (task)
+				goto found_panic_task;
+		}
+	}
+
+found_panic_task:
+	close_tmpfile();
+fail:
+	if (CRASHDEBUG(1) && !task)
+		 error(WARNING, "cannot determine the panic task from kernel log buffer\n");
+
+	return task;
 }
 
 /*
@@ -7535,7 +7713,7 @@ print_task_header(FILE *out, struct task_context *tc, int newline)
 	char buf[BUFSIZE];
 	char buf1[BUFSIZE];
 
-        fprintf(out, "%sPID: %-5ld  TASK: %s  CPU: %-2s  COMMAND: \"%s\"\n",
+        fprintf(out, "%sPID: %-7ld  TASK: %s  CPU: %-3s  COMMAND: \"%s\"\n",
 		newline ? "\n" : "", tc->pid, 
 		mkstring(buf1, VADDR_PRLEN, LJUST|LONG_HEX, MKSTR(tc->task)),
 		task_cpu(tc->processor, buf, !VERBOSE), tc->comm);
@@ -11022,7 +11200,7 @@ check_stack_overflow(void)
 {
 	int i, overflow, cpu_size, cpu, total;
 	char buf[BUFSIZE];
-	ulong magic, task, stackbase;
+	ulong magic, task, stackbase, location;
 	struct task_context *tc;
 
 	if (!tt->stack_end_magic && 
@@ -11106,9 +11284,15 @@ check_stack_end_magic:
 		if (magic != STACK_END_MAGIC) {
 			if (!overflow)
 				print_task_header(fp, tc, 0);
+
+			if (tt->flags & THREAD_INFO_IN_TASK)
+				location = task_to_stackbase(tc->task);
+			else
+				location = tc->thread_info + SIZE(thread_info);
+
 			fprintf(fp, 
 			    "  possible stack overflow: %lx: %lx != STACK_END_MAGIC\n",
-				tc->thread_info + SIZE(thread_info), magic);
+				location, magic);
 			overflow++, total++;
 		}
 

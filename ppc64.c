@@ -225,6 +225,13 @@ static int ppc64_is_vmaddr(ulong addr)
 static int set_ppc64_max_physmem_bits(void)
 {
 	int dimension;
+	char *string;
+
+	if ((string = pc->read_vmcoreinfo("NUMBER(MAX_PHYSMEM_BITS)"))) {
+		machdep->max_physmem_bits = atol(string);
+		free(string);
+		return 0;
+	}
 
 	get_array_length("mem_section", &dimension, 0);
 
@@ -3020,6 +3027,8 @@ ppc64_display_machine_stats(void)
         else
                 fprintf(fp, "(unknown)\n");
         fprintf(fp, "                 HZ: %d\n", machdep->hz);
+	fprintf(fp, "                MMU: %s\n", machdep->flags & RADIX_MMU
+							? "RADIX" : "HASH");
         fprintf(fp, "          PAGE SIZE: %d\n", PAGESIZE());
 //      fprintf(fp, "      L1 CACHE SIZE: %d\n", l1_cache_size());
         fprintf(fp, "KERNEL VIRTUAL BASE: %lx\n", machdep->kvbase);
