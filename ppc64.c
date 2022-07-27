@@ -48,14 +48,19 @@ static ulong ppc64_get_stackbase(ulong);
 static ulong ppc64_get_stacktop(ulong);
 void ppc64_compiler_warning_stub(void);
 static ulong ppc64_in_irqstack(ulong);
+static enum emergency_stack_type ppc64_in_emergency_stack(int cpu, ulong addr,
+							  bool verbose);
+static void ppc64_set_bt_emergency_stack(enum emergency_stack_type type,
+					 struct bt_info *bt);
 static char * ppc64_check_eframe(struct ppc64_pt_regs *);
 static void ppc64_print_eframe(char *, struct ppc64_pt_regs *, 
 		struct bt_info *);
 static void parse_cmdline_args(void);
-static int ppc64_paca_init(int);
+static int ppc64_paca_percpu_offset_init(int);
 static void ppc64_init_cpu_info(void);
 static int ppc64_get_cpu_map(void);
 static void ppc64_clear_machdep_cache(void);
+static void ppc64_init_paca_info(void);
 static void ppc64_vmemmap_init(void);
 static int ppc64_get_kvaddr_ranges(struct vaddr_range *);
 static uint get_ptetype(ulong pte);
@@ -256,7 +261,7 @@ static int set_ppc64_max_physmem_bits(void)
 }
 
 struct machine_specific ppc64_machine_specific = { 
-	.hwintrstack = { 0 }, 
+	.hwintrstack = NULL,
 	.hwstackbuf = 0,
 	.hwstacksize = 0,
 	.pte_rpn_shift = PTE_RPN_SHIFT_DEFAULT,
@@ -275,7 +280,7 @@ struct machine_specific ppc64_machine_specific = {
 };
 
 struct machine_specific book3e_machine_specific = {
-	.hwintrstack = { 0 },
+	.hwintrstack = NULL,
 	.hwstackbuf = 0,
 	.hwstacksize = 0,
 	.pte_rpn_shift = PTE_RPN_SHIFT_L4_BOOK3E_64K,
@@ -302,6 +307,8 @@ struct machine_specific book3e_machine_specific = {
 void
 ppc64_init(int when)
 {
+	struct machine_specific *ms;
+
 #if defined(__x86_64__)
         if (ACTIVE())
                 error(FATAL, "compiled for the PPC64 architecture\n");
@@ -411,16 +418,16 @@ ppc64_init(int when)
 		break;
 
 	case POST_GDB:
-		if (!(machdep->flags & BOOK3E)) {
-			struct machine_specific *m = machdep->machspec;
+		ms = machdep->machspec;
 
+		if (!(machdep->flags & BOOK3E)) {
 			/*
 			 * To determine if the kernel was running on OPAL based platform,
 			 * use struct opal, which is populated with relevant values.
 			 */
 			if (symbol_exists("opal")) {
-				get_symbol_data("opal", sizeof(struct ppc64_opal), &(m->opal));
-				if (m->opal.base == SKIBOOT_BASE)
+				get_symbol_data("opal", sizeof(struct ppc64_opal), &(ms->opal));
+				if (ms->opal.base == SKIBOOT_BASE)
 					machdep->flags |= OPAL_FW;
 			}
 
@@ -448,18 +455,18 @@ ppc64_init(int when)
 			 * _PAGE_WRITETHRU  can be used to infer it.
 			 */
 			if (THIS_KERNEL_VERSION >= LINUX(3,14,0))
-				m->_page_coherent = 0x0UL;
+				ms->_page_coherent = 0x0UL;
 
 			/*
 			 * In kernel v4.5, _PAGE_PTE bit is introduced to
 			 * distinguish PTEs from pointers.
 			 */
 			if (THIS_KERNEL_VERSION >= LINUX(4,5,0)) {
-				m->_page_pte = 0x1UL;
-				m->_page_present = 0x2UL;
-				m->_page_user = 0x4UL;
-				m->_page_rw = 0x8UL;
-				m->_page_guarded = 0x10UL;
+				ms->_page_pte = 0x1UL;
+				ms->_page_present = 0x2UL;
+				ms->_page_user = 0x4UL;
+				ms->_page_rw = 0x8UL;
+				ms->_page_guarded = 0x10UL;
 			}
 
 			/*
@@ -469,8 +476,8 @@ ppc64_init(int when)
 			 * Also, page table entries store physical addresses.
 			 */
 			if (THIS_KERNEL_VERSION >= LINUX(4,6,0)) {
-				m->_page_pte = 0x1UL << 62;
-				m->_page_present = 0x1UL << 63;
+				ms->_page_pte = 0x1UL << 62;
+				ms->_page_present = 0x1UL << 63;
 				machdep->flags |= PHYS_ENTRY_L4;
 			}
 
@@ -499,118 +506,117 @@ ppc64_init(int when)
 			machdep->ptrs_per_pgd = PTRS_PER_PGD;
 		} else {
 			/* 2.6.14 layout */
-			struct machine_specific *m = machdep->machspec;
 			if (machdep->pagesize == 65536) {
 				/* 64K pagesize */
 				if (machdep->flags & RADIX_MMU) {
-					m->l1_index_size = PTE_INDEX_SIZE_RADIX_64K;
-					m->l2_index_size = PMD_INDEX_SIZE_RADIX_64K;
-					m->l3_index_size = PUD_INDEX_SIZE_RADIX_64K;
-					m->l4_index_size = PGD_INDEX_SIZE_RADIX_64K;
+					ms->l1_index_size = PTE_INDEX_SIZE_RADIX_64K;
+					ms->l2_index_size = PMD_INDEX_SIZE_RADIX_64K;
+					ms->l3_index_size = PUD_INDEX_SIZE_RADIX_64K;
+					ms->l4_index_size = PGD_INDEX_SIZE_RADIX_64K;
 
 				} else if (!(machdep->flags & BOOK3E) &&
 				    (THIS_KERNEL_VERSION >= LINUX(4,6,0))) {
-					m->l1_index_size = PTE_INDEX_SIZE_L4_64K_3_10;
+					ms->l1_index_size = PTE_INDEX_SIZE_L4_64K_3_10;
 
 					if (THIS_KERNEL_VERSION >= LINUX(4,12,0)) {
-						m->l2_index_size = PMD_INDEX_SIZE_L4_64K_4_12;
+						ms->l2_index_size = PMD_INDEX_SIZE_L4_64K_4_12;
 						if (THIS_KERNEL_VERSION >= LINUX(4,17,0))
-							m->l3_index_size = PUD_INDEX_SIZE_L4_64K_4_17;
+							ms->l3_index_size = PUD_INDEX_SIZE_L4_64K_4_17;
 						else
-							m->l3_index_size = PUD_INDEX_SIZE_L4_64K_4_12;
-						m->l4_index_size = PGD_INDEX_SIZE_L4_64K_4_12;
+							ms->l3_index_size = PUD_INDEX_SIZE_L4_64K_4_12;
+						ms->l4_index_size = PGD_INDEX_SIZE_L4_64K_4_12;
 					} else {
-						m->l2_index_size = PMD_INDEX_SIZE_L4_64K_4_6;
-						m->l3_index_size = PUD_INDEX_SIZE_L4_64K_4_6;
-						m->l4_index_size = PGD_INDEX_SIZE_L4_64K_3_10;
+						ms->l2_index_size = PMD_INDEX_SIZE_L4_64K_4_6;
+						ms->l3_index_size = PUD_INDEX_SIZE_L4_64K_4_6;
+						ms->l4_index_size = PGD_INDEX_SIZE_L4_64K_3_10;
 					}
 				} else if (THIS_KERNEL_VERSION >= LINUX(3,10,0)) {
-					m->l1_index_size = PTE_INDEX_SIZE_L4_64K_3_10;
-					m->l2_index_size = PMD_INDEX_SIZE_L4_64K_3_10;
-					m->l3_index_size = PUD_INDEX_SIZE_L4_64K;
-					m->l4_index_size = PGD_INDEX_SIZE_L4_64K_3_10;
+					ms->l1_index_size = PTE_INDEX_SIZE_L4_64K_3_10;
+					ms->l2_index_size = PMD_INDEX_SIZE_L4_64K_3_10;
+					ms->l3_index_size = PUD_INDEX_SIZE_L4_64K;
+					ms->l4_index_size = PGD_INDEX_SIZE_L4_64K_3_10;
 
 				} else {
-					m->l1_index_size = PTE_INDEX_SIZE_L4_64K;
-					m->l2_index_size = PMD_INDEX_SIZE_L4_64K;
-					m->l3_index_size = PUD_INDEX_SIZE_L4_64K;
-					m->l4_index_size = PGD_INDEX_SIZE_L4_64K;
+					ms->l1_index_size = PTE_INDEX_SIZE_L4_64K;
+					ms->l2_index_size = PMD_INDEX_SIZE_L4_64K;
+					ms->l3_index_size = PUD_INDEX_SIZE_L4_64K;
+					ms->l4_index_size = PGD_INDEX_SIZE_L4_64K;
 				}
 
 				if (!(machdep->flags & BOOK3E))
-					m->pte_rpn_shift = symbol_exists("demote_segment_4k") ?
+					ms->pte_rpn_shift = symbol_exists("demote_segment_4k") ?
 						PTE_RPN_SHIFT_L4_64K_V2 : PTE_RPN_SHIFT_L4_64K_V1;
 
 				if (!(machdep->flags & BOOK3E) &&
 				    (THIS_KERNEL_VERSION >= LINUX(4,6,0))) {
-					m->pgd_masked_bits = PGD_MASKED_BITS_64K_4_6;
-					m->pud_masked_bits = PUD_MASKED_BITS_64K_4_6;
-					m->pmd_masked_bits = PMD_MASKED_BITS_64K_4_6;
+					ms->pgd_masked_bits = PGD_MASKED_BITS_64K_4_6;
+					ms->pud_masked_bits = PUD_MASKED_BITS_64K_4_6;
+					ms->pmd_masked_bits = PMD_MASKED_BITS_64K_4_6;
 				} else {
-					m->pgd_masked_bits = PGD_MASKED_BITS_64K;
-					m->pud_masked_bits = PUD_MASKED_BITS_64K;
+					ms->pgd_masked_bits = PGD_MASKED_BITS_64K;
+					ms->pud_masked_bits = PUD_MASKED_BITS_64K;
 					if ((machdep->flags & BOOK3E) &&
 					    (THIS_KERNEL_VERSION >= LINUX(4,5,0)))
-						m->pmd_masked_bits = PMD_MASKED_BITS_BOOK3E_64K_4_5;
+						ms->pmd_masked_bits = PMD_MASKED_BITS_BOOK3E_64K_4_5;
 					else if (THIS_KERNEL_VERSION >= LINUX(3,11,0))
-						m->pmd_masked_bits = PMD_MASKED_BITS_64K_3_11;
+						ms->pmd_masked_bits = PMD_MASKED_BITS_64K_3_11;
 					else
-						m->pmd_masked_bits = PMD_MASKED_BITS_64K;
+						ms->pmd_masked_bits = PMD_MASKED_BITS_64K;
 				}
 			} else {
 				/* 4K pagesize */
 				if (machdep->flags & RADIX_MMU) {
-					m->l1_index_size = PTE_INDEX_SIZE_RADIX_4K;
-					m->l2_index_size = PMD_INDEX_SIZE_RADIX_4K;
-					m->l3_index_size = PUD_INDEX_SIZE_RADIX_4K;
-					m->l4_index_size = PGD_INDEX_SIZE_RADIX_4K;
+					ms->l1_index_size = PTE_INDEX_SIZE_RADIX_4K;
+					ms->l2_index_size = PMD_INDEX_SIZE_RADIX_4K;
+					ms->l3_index_size = PUD_INDEX_SIZE_RADIX_4K;
+					ms->l4_index_size = PGD_INDEX_SIZE_RADIX_4K;
 
 				} else {
-					m->l1_index_size = PTE_INDEX_SIZE_L4_4K;
-					m->l2_index_size = PMD_INDEX_SIZE_L4_4K;
+					ms->l1_index_size = PTE_INDEX_SIZE_L4_4K;
+					ms->l2_index_size = PMD_INDEX_SIZE_L4_4K;
 					if (THIS_KERNEL_VERSION >= LINUX(3,7,0))
-						m->l3_index_size = PUD_INDEX_SIZE_L4_4K_3_7;
+						ms->l3_index_size = PUD_INDEX_SIZE_L4_4K_3_7;
 					else
-						m->l3_index_size = PUD_INDEX_SIZE_L4_4K;
-					m->l4_index_size = PGD_INDEX_SIZE_L4_4K;
+						ms->l3_index_size = PUD_INDEX_SIZE_L4_4K;
+					ms->l4_index_size = PGD_INDEX_SIZE_L4_4K;
 
 					if (machdep->flags & BOOK3E)
-						m->pte_rpn_shift = PTE_RPN_SHIFT_L4_BOOK3E_4K;
+						ms->pte_rpn_shift = PTE_RPN_SHIFT_L4_BOOK3E_4K;
 					else
-						m->pte_rpn_shift = THIS_KERNEL_VERSION >= LINUX(4,5,0) ?
+						ms->pte_rpn_shift = THIS_KERNEL_VERSION >= LINUX(4,5,0) ?
 							PTE_RPN_SHIFT_L4_4K_4_5 : PTE_RPN_SHIFT_L4_4K;
 				}
 
-				m->pgd_masked_bits = PGD_MASKED_BITS_4K;
-				m->pud_masked_bits = PUD_MASKED_BITS_4K;
-				m->pmd_masked_bits = PMD_MASKED_BITS_4K;
+				ms->pgd_masked_bits = PGD_MASKED_BITS_4K;
+				ms->pud_masked_bits = PUD_MASKED_BITS_4K;
+				ms->pmd_masked_bits = PMD_MASKED_BITS_4K;
 			}
 
-			m->pte_rpn_mask = PTE_RPN_MASK_DEFAULT;
+			ms->pte_rpn_mask = PTE_RPN_MASK_DEFAULT;
 			if (!(machdep->flags & BOOK3E)) {
 				if (THIS_KERNEL_VERSION >= LINUX(4,6,0)) {
-					m->pte_rpn_mask = PTE_RPN_MASK_L4_4_6;
-					m->pte_rpn_shift = PTE_RPN_SHIFT_L4_4_6;
+					ms->pte_rpn_mask = PTE_RPN_MASK_L4_4_6;
+					ms->pte_rpn_shift = PTE_RPN_SHIFT_L4_4_6;
 				}
 				if (THIS_KERNEL_VERSION >= LINUX(4,7,0)) {
-					m->pgd_masked_bits = PGD_MASKED_BITS_4_7;
-					m->pud_masked_bits = PUD_MASKED_BITS_4_7;
-					m->pmd_masked_bits = PMD_MASKED_BITS_4_7;
+					ms->pgd_masked_bits = PGD_MASKED_BITS_4_7;
+					ms->pud_masked_bits = PUD_MASKED_BITS_4_7;
+					ms->pmd_masked_bits = PMD_MASKED_BITS_4_7;
 				}
 			}
 
 			/* Compute ptrs per each level */
-			m->l1_shift = machdep->pageshift;
-			m->ptrs_per_l1 = (1 << m->l1_index_size);
-			m->ptrs_per_l2 = (1 << m->l2_index_size);
-			m->ptrs_per_l3 = (1 << m->l3_index_size);
-			m->ptrs_per_l4 = (1 << m->l4_index_size);
-			machdep->ptrs_per_pgd = m->ptrs_per_l4;
+			ms->l1_shift = machdep->pageshift;
+			ms->ptrs_per_l1 = (1 << ms->l1_index_size);
+			ms->ptrs_per_l2 = (1 << ms->l2_index_size);
+			ms->ptrs_per_l3 = (1 << ms->l3_index_size);
+			ms->ptrs_per_l4 = (1 << ms->l4_index_size);
+			machdep->ptrs_per_pgd = ms->ptrs_per_l4;
 
 			/* Compute shifts */
-			m->l2_shift = m->l1_shift + m->l1_index_size;
-			m->l3_shift = m->l2_shift + m->l2_index_size;
-			m->l4_shift = m->l3_shift + m->l3_index_size;
+			ms->l2_shift = ms->l1_shift + ms->l1_index_size;
+			ms->l3_shift = ms->l2_shift + ms->l2_index_size;
+			ms->l4_shift = ms->l3_shift + ms->l3_index_size;
 		}
 
 		if (machdep->flags & VMEMMAP)
@@ -676,24 +682,20 @@ ppc64_init(int when)
 			 */
 			offset = MEMBER_OFFSET("paca_struct", "xHrdIntStack");
 			paca_sym  = symbol_value("paca");
+			if (!(ms->hwintrstack = (ulong *)calloc(NR_CPUS, sizeof(ulong))))
+				error(FATAL, "cannot malloc hwintrstack space.");
 			for (cpu = 0; cpu < kt->cpus; cpu++)  {
-				readmem(paca_sym + (paca_size * cpu) + offset,
-					KVADDR, 
-					&machdep->machspec->hwintrstack[cpu],
-					sizeof(ulong), "PPC64 HW_intr_stack",
-					FAULT_ON_ERROR);
+				readmem(paca_sym + (paca_size * cpu) + offset, KVADDR,
+					&ms->hwintrstack[cpu], sizeof(ulong),
+					"PPC64 HW_intr_stack", FAULT_ON_ERROR);
 			}
-			machdep->machspec->hwstacksize = 8 * machdep->pagesize;
-			if ((machdep->machspec->hwstackbuf = (char *)
-				malloc(machdep->machspec->hwstacksize)) == NULL)
-				error(FATAL, "cannot malloc hwirqstack space.");
-		} else
-			/*
-			 * 'xHrdIntStack' member in "paca_struct" is not 
-			 * available for 2.6 kernel. 
-			 */
-			BZERO(&machdep->machspec->hwintrstack,
-				NR_CPUS*sizeof(ulong));
+			ms->hwstacksize = 8 * machdep->pagesize;
+			if ((ms->hwstackbuf = (char *)malloc(ms->hwstacksize)) == NULL)
+				error(FATAL, "cannot malloc hwirqstack buffer space.");
+		}
+
+		ppc64_init_paca_info();
+
 		if (!machdep->hz) {
 			machdep->hz = HZ;
 			if (THIS_KERNEL_VERSION >= LINUX(2,6,0))
@@ -751,6 +753,7 @@ ppc64_get_stacktop(ulong task)
 void
 ppc64_dump_machdep_table(ulong arg)
 {
+	struct machine_specific *ms = machdep->machspec;
         int i, c, others; 
  
         others = 0;
@@ -839,65 +842,57 @@ ppc64_dump_machdep_table(ulong arg)
                         i, machdep->cmdline_args[i] ?
                         machdep->cmdline_args[i] : "(unused)");
         }
-	fprintf(fp, "           machspec: %lx\n", (ulong)machdep->machspec);
+	fprintf(fp, "           machspec: %lx\n", (ulong)ms);
 	fprintf(fp, "            is_kvaddr: %s\n", 
-		machdep->machspec->is_kvaddr == book3e_is_kvaddr ? 
+		ms->is_kvaddr == book3e_is_kvaddr ?
 		"book3e_is_kvaddr()" : "generic_is_kvaddr()");
 	fprintf(fp, "            is_vmaddr: %s\n", 
-		machdep->machspec->is_vmaddr == book3e_is_vmaddr ? 
+		ms->is_vmaddr == book3e_is_vmaddr ?
 		"book3e_is_vmaddr()" : "ppc64_is_vmaddr()");
-	fprintf(fp, "    hwintrstack[%d]: ", NR_CPUS);
-       	for (c = 0; c < NR_CPUS; c++) {
-		for (others = 0, i = c; i < NR_CPUS; i++) {
-			if (machdep->machspec->hwintrstack[i])
-				others++;
+	if (ms->hwintrstack) {
+		fprintf(fp, "    hwintrstack[%d]: ", NR_CPUS);
+		for (c = 0; c < NR_CPUS; c++) {
+			fprintf(fp, "%s%016lx ",
+				((c % 4) == 0) ? "\n  " : "",
+				ms->hwintrstack[c]);
 		}
-		if (!others) {
-			fprintf(fp, "%s%s", 
-			        c && ((c % 4) == 0) ? "\n  " : "",
-				c ? "(remainder unused)" : "(unused)");
-			break;
-		}
-
-		fprintf(fp, "%s%016lx ", 
-			((c % 4) == 0) ? "\n  " : "",
-			machdep->machspec->hwintrstack[c]);
-	}
+	} else
+		fprintf(fp, "          hwintrstack: (unused)");
 	fprintf(fp, "\n");
-	fprintf(fp, "           hwstackbuf: %lx\n", (ulong)machdep->machspec->hwstackbuf);
-	fprintf(fp, "          hwstacksize: %d\n", machdep->machspec->hwstacksize);
-	fprintf(fp, "        l4_index_size: %d\n", machdep->machspec->l4_index_size);
-	fprintf(fp, "        l3_index_size: %d\n", machdep->machspec->l3_index_size);
-	fprintf(fp, "        l2_index_size: %d\n", machdep->machspec->l2_index_size);
-	fprintf(fp, "        l1_index_size: %d\n", machdep->machspec->l1_index_size);
-	fprintf(fp, "          ptrs_per_l4: %d\n", machdep->machspec->ptrs_per_l4);
-	fprintf(fp, "          ptrs_per_l3: %d\n", machdep->machspec->ptrs_per_l3);
-	fprintf(fp, "          ptrs_per_l2: %d\n", machdep->machspec->ptrs_per_l2);
-	fprintf(fp, "          ptrs_per_l1: %d\n", machdep->machspec->ptrs_per_l1);
-	fprintf(fp, "             l4_shift: %d\n", machdep->machspec->l4_shift);
-	fprintf(fp, "             l3_shift: %d\n", machdep->machspec->l3_shift);
-	fprintf(fp, "             l2_shift: %d\n", machdep->machspec->l2_shift);
-	fprintf(fp, "             l1_shift: %d\n", machdep->machspec->l1_shift);
-	fprintf(fp, "         pte_rpn_mask: %lx\n", machdep->machspec->pte_rpn_mask);
-	fprintf(fp, "        pte_rpn_shift: %d\n", machdep->machspec->pte_rpn_shift);
-	fprintf(fp, "      pgd_masked_bits: %lx\n", machdep->machspec->pgd_masked_bits);
-	fprintf(fp, "      pud_masked_bits: %lx\n", machdep->machspec->pud_masked_bits);
-	fprintf(fp, "      pmd_masked_bits: %lx\n", machdep->machspec->pmd_masked_bits);
+	fprintf(fp, "           hwstackbuf: %lx\n", (ulong)ms->hwstackbuf);
+	fprintf(fp, "          hwstacksize: %d\n", ms->hwstacksize);
+	fprintf(fp, "        l4_index_size: %d\n", ms->l4_index_size);
+	fprintf(fp, "        l3_index_size: %d\n", ms->l3_index_size);
+	fprintf(fp, "        l2_index_size: %d\n", ms->l2_index_size);
+	fprintf(fp, "        l1_index_size: %d\n", ms->l1_index_size);
+	fprintf(fp, "          ptrs_per_l4: %d\n", ms->ptrs_per_l4);
+	fprintf(fp, "          ptrs_per_l3: %d\n", ms->ptrs_per_l3);
+	fprintf(fp, "          ptrs_per_l2: %d\n", ms->ptrs_per_l2);
+	fprintf(fp, "          ptrs_per_l1: %d\n", ms->ptrs_per_l1);
+	fprintf(fp, "             l4_shift: %d\n", ms->l4_shift);
+	fprintf(fp, "             l3_shift: %d\n", ms->l3_shift);
+	fprintf(fp, "             l2_shift: %d\n", ms->l2_shift);
+	fprintf(fp, "             l1_shift: %d\n", ms->l1_shift);
+	fprintf(fp, "         pte_rpn_mask: %lx\n", ms->pte_rpn_mask);
+	fprintf(fp, "        pte_rpn_shift: %d\n", ms->pte_rpn_shift);
+	fprintf(fp, "      pgd_masked_bits: %lx\n", ms->pgd_masked_bits);
+	fprintf(fp, "      pud_masked_bits: %lx\n", ms->pud_masked_bits);
+	fprintf(fp, "      pmd_masked_bits: %lx\n", ms->pmd_masked_bits);
 	fprintf(fp, "         vmemmap_base: "); 
-	if (machdep->machspec->vmemmap_base)
-		fprintf(fp, "%lx\n", machdep->machspec->vmemmap_base);
+	if (ms->vmemmap_base)
+		fprintf(fp, "%lx\n", ms->vmemmap_base);
 	else
 		fprintf(fp, "(unused)\n");
-	if (machdep->machspec->vmemmap_cnt) {
+	if (ms->vmemmap_cnt) {
 		fprintf(fp, "          vmemmap_cnt: %d\n", 
-			machdep->machspec->vmemmap_cnt);
+			ms->vmemmap_cnt);
 		fprintf(fp, "        vmemmap_psize: %d\n", 
-			machdep->machspec->vmemmap_psize);
-		for (i = 0; i < machdep->machspec->vmemmap_cnt; i++) {
+			ms->vmemmap_psize);
+		for (i = 0; i < ms->vmemmap_cnt; i++) {
 			fprintf(fp, 
 			    "      vmemmap_list[%d]: virt: %lx  phys: %lx\n", i, 
-				machdep->machspec->vmemmap_list[i].virt,
-				machdep->machspec->vmemmap_list[i].phys);
+				ms->vmemmap_list[i].virt,
+				ms->vmemmap_list[i].phys);
 		}
 	} else {
 		fprintf(fp, "          vmemmap_cnt: (unused)\n");
@@ -1212,6 +1207,70 @@ ppc64_kvtop(struct task_context *tc, ulong kvaddr,
 		return ppc64_vtop_level4(kvaddr, (ulong *)vt->kernel_pgd[0], paddr, verbose);
 	else
 		return ppc64_vtop(kvaddr, (ulong *)vt->kernel_pgd[0], paddr, verbose);
+}
+
+static void
+ppc64_init_paca_info(void)
+{
+	struct machine_specific *ms = machdep->machspec;
+	ulong *paca_ptr;
+	int i;
+
+	if (!(paca_ptr = (ulong *)calloc(kt->cpus, sizeof(ulong))))
+		error(FATAL, "cannot malloc paca pointers space.\n");
+
+	/* Get paca pointers for all CPUs. */
+	if (symbol_exists("paca_ptrs")) {
+		ulong paca_loc;
+
+		readmem(symbol_value("paca_ptrs"), KVADDR, &paca_loc, sizeof(void *),
+			"paca double pointer", FAULT_ON_ERROR);
+		readmem(paca_loc, KVADDR, paca_ptr, sizeof(void *) * kt->cpus,
+			"paca pointers", FAULT_ON_ERROR);
+	} else if (symbol_exists("paca") &&
+		   (get_symbol_type("paca", NULL, NULL) == TYPE_CODE_PTR)) {
+		readmem(symbol_value("paca"), KVADDR, paca_ptr, sizeof(void *) * kt->cpus,
+			"paca pointers", FAULT_ON_ERROR);
+	} else {
+		free(paca_ptr);
+		return;
+	}
+
+	/* Initialize emergency stacks info. */
+	if (MEMBER_EXISTS("paca_struct", "emergency_sp")) {
+		ulong offset = MEMBER_OFFSET("paca_struct", "emergency_sp");
+
+		if (!(ms->emergency_sp = (ulong *)calloc(kt->cpus, sizeof(ulong))))
+			error(FATAL, "cannot malloc emergency stack space.\n");
+		for (i = 0; i < kt->cpus; i++)
+			readmem(paca_ptr[i] + offset, KVADDR, &ms->emergency_sp[i],
+				sizeof(void *), "paca->emergency_sp",
+				FAULT_ON_ERROR);
+	}
+
+	if (MEMBER_EXISTS("paca_struct", "nmi_emergency_sp")) {
+		ulong offset = MEMBER_OFFSET("paca_struct", "nmi_emergency_sp");
+
+		if (!(ms->nmi_emergency_sp = (ulong *)calloc(kt->cpus, sizeof(ulong))))
+			error(FATAL, "cannot malloc NMI emergency stack space.\n");
+		for (i = 0; i < kt->cpus; i++)
+			readmem(paca_ptr[i] + offset, KVADDR, &ms->nmi_emergency_sp[i],
+				sizeof(void *), "paca->nmi_emergency_sp",
+				FAULT_ON_ERROR);
+	}
+
+	if (MEMBER_EXISTS("paca_struct", "mc_emergency_sp")) {
+		ulong offset = MEMBER_OFFSET("paca_struct", "mc_emergency_sp");
+
+		if (!(ms->mc_emergency_sp = (ulong *)calloc(kt->cpus, sizeof(ulong))))
+			error(FATAL, "cannot malloc machine check emergency stack space.\n");
+		for (i = 0; i < kt->cpus; i++)
+			readmem(paca_ptr[i] + offset, KVADDR, &ms->mc_emergency_sp[i],
+				sizeof(void *), "paca->mc_emergency_sp",
+				FAULT_ON_ERROR);
+	}
+
+	free(paca_ptr);
 }
 
 /*
@@ -1683,9 +1742,10 @@ ppc64_check_sp_in_HWintrstack(ulong sp, struct bt_info *bt)
 	 * 
 	 * Note: HW Interrupt stack is used only in 2.4 kernel.
 	 */
-	if (is_task_active(bt->task) && (tt->panic_task != bt->task) &&
-		machdep->machspec->hwintrstack[bt->tc->processor]) {
+	if (machdep->machspec->hwintrstack && is_task_active(bt->task) &&
+	    (bt->task != tt->panic_task)) {
 		ulong newsp;
+
 		readmem(machdep->machspec->hwintrstack[bt->tc->processor],
 			KVADDR, &newsp, sizeof(ulong),
 			"stack pointer", FAULT_ON_ERROR);
@@ -1764,6 +1824,11 @@ ppc64_eframe_search(struct bt_info *bt_in)
 			addr = bt->stackbase +
 				roundup(SIZE(thread_info), sizeof(ulong));
 		} else if (!INSTACK(addr, bt)) {
+			enum emergency_stack_type estype;
+
+			if ((estype = ppc64_in_emergency_stack(bt->tc->processor, addr, false)))
+				ppc64_set_bt_emergency_stack(estype, bt);
+
 			/*
 			 * If the user specified SP is in HW interrupt stack
 			 * (only for tasks running on other CPUs and in 2.4
@@ -1866,6 +1931,84 @@ ppc64_in_irqstack(ulong addr)
 }
 
 /*
+ * Check if the CPU is running in any of its emergency stacks.
+ * Returns
+ *	NONE_STACK          : if input is invalid or addr is not within any emergency stack.
+ *	EMERGENCY_STACK     : if the addr is within emergency stack.
+ *	NMI_EMERGENCY_STACK : if the addr is within NMI emergency stack.
+ *	MC_EMERGENCY_STACK  : if the addr is within machine check emergency stack.
+ */
+static enum emergency_stack_type
+ppc64_in_emergency_stack(int cpu, ulong addr, bool verbose)
+{
+	struct machine_specific *ms = machdep->machspec;
+	ulong base, top;
+
+	if (cpu < 0  || cpu >= kt->cpus)
+		return NONE_STACK;
+
+	if (ms->emergency_sp) {
+		top = ms->emergency_sp[cpu];
+		base =  top - STACKSIZE();
+		if (addr >= base && addr < top) {
+			if (verbose)
+				fprintf(fp, "---<Emergency Stack>---\n");
+			return EMERGENCY_STACK;
+		}
+	}
+
+	if (ms->nmi_emergency_sp) {
+		top = ms->nmi_emergency_sp[cpu];
+		base = top - STACKSIZE();
+		if (addr >= base && addr < top) {
+			if (verbose)
+				fprintf(fp, "---<NMI Emergency Stack>---\n");
+			return NMI_EMERGENCY_STACK;
+		}
+	}
+
+	if (ms->mc_emergency_sp) {
+		top = ms->mc_emergency_sp[cpu];
+		base =  top - STACKSIZE();
+		if (addr >= base && addr < top) {
+			if (verbose)
+				fprintf(fp, "---<Machine Check Emergency Stack>---\n");
+			return MC_EMERGENCY_STACK;
+		}
+	}
+
+	return NONE_STACK;
+}
+
+static void
+ppc64_set_bt_emergency_stack(enum emergency_stack_type type, struct bt_info *bt)
+{
+	struct machine_specific *ms = machdep->machspec;
+	ulong top;
+
+	switch (type) {
+	case EMERGENCY_STACK:
+		top = ms->emergency_sp[bt->tc->processor];
+		break;
+	case NMI_EMERGENCY_STACK:
+		top = ms->nmi_emergency_sp[bt->tc->processor];
+		break;
+	case MC_EMERGENCY_STACK:
+		top = ms->mc_emergency_sp[bt->tc->processor];
+		break;
+	default:
+		top = 0;
+		break;
+	}
+
+	if (top) {
+		bt->stackbase = top - STACKSIZE();
+		bt->stacktop = top;
+		alter_stackbuf(bt);
+	}
+}
+
+/*
  *  Unroll a kernel stack.
  */
 static void
@@ -1945,10 +2088,13 @@ ppc64_back_trace_cmd(struct bt_info *bt)
 static void
 ppc64_back_trace(struct gnu_request *req, struct bt_info *bt)
 {
+	enum emergency_stack_type estype;
+	ulong newpc = 0, newsp, marker;
+	int c = bt->tc->processor;
+	ulong nmi_sp = 0;
+	int eframe_found;
 	int frame = 0;
 	ulong lr = 0; /* hack...need to pass in initial lr reg */
-	ulong newpc = 0, newsp, marker;
-	int eframe_found;
 
 	if (!INSTACK(req->sp, bt)) {
 		ulong irqstack;
@@ -1958,7 +2104,11 @@ ppc64_back_trace(struct gnu_request *req, struct bt_info *bt)
 			bt->stackbase = irqstack;
 			bt->stacktop = bt->stackbase + STACKSIZE();
 			alter_stackbuf(bt);
-		} else if (ms->hwintrstack[bt->tc->processor]) {
+		} else if ((estype = ppc64_in_emergency_stack(c, req->sp, true))) {
+			if (estype == NMI_EMERGENCY_STACK)
+				nmi_sp = req->sp;
+			ppc64_set_bt_emergency_stack(estype, bt);
+		} else if (ms->hwintrstack) {
 			bt->stacktop = ms->hwintrstack[bt->tc->processor] +
 				sizeof(ulong);
 			bt->stackbase = ms->hwintrstack[bt->tc->processor] - 
@@ -1966,9 +2116,7 @@ ppc64_back_trace(struct gnu_request *req, struct bt_info *bt)
 			bt->stackbuf = ms->hwstackbuf;
 			alter_stackbuf(bt);
 		} else {
-			if (CRASHDEBUG(1)) {
-				fprintf(fp, "cannot find the stack info.\n");
-			}
+			fprintf(fp, "cannot find the stack info.\n");
 			return;
 		}
 	}
@@ -1998,13 +2146,20 @@ ppc64_back_trace(struct gnu_request *req, struct bt_info *bt)
 				newsp = 
 				*(ulong *)&bt->stackbuf[newsp - bt->stackbase];
 			if (!INSTACK(newsp, bt)) {
-                        	/*
-                         	* Switch HW interrupt stack to process's stack.
-                         	*/
-                        	bt->stackbase = GET_STACKBASE(bt->task);
-                        	bt->stacktop = GET_STACKTOP(bt->task);
-                        	alter_stackbuf(bt);
-                	}  
+				if ((estype = ppc64_in_emergency_stack(c, newsp, true))) {
+					if (!nmi_sp && estype == NMI_EMERGENCY_STACK)
+						nmi_sp = newsp;
+					ppc64_set_bt_emergency_stack(estype, bt);
+				} else {
+					/*
+					 * Switch HW interrupt stack or emergency stack
+					 * to process's stack.
+					 */
+					bt->stackbase = GET_STACKBASE(bt->task);
+					bt->stacktop = GET_STACKTOP(bt->task);
+					alter_stackbuf(bt);
+				}
+			}
 			if (IS_KVADDR(newsp) && INSTACK(newsp, bt))
 				newpc = *(ulong *)&bt->stackbuf[newsp + 16 -
 						bt->stackbase];
@@ -2046,6 +2201,16 @@ ppc64_back_trace(struct gnu_request *req, struct bt_info *bt)
 				newpc = regs.nip;
 				newsp = regs.gpr[1];
 			} 
+		}
+
+		/*
+		 * NMI stack may not be re-entrant. In so, an SP in the NMI stack
+		 * is likely to point back to an SP within the NMI stack, in case
+		 * of a nested NMI.
+		 */
+		if (nmi_sp && nmi_sp == newsp) {
+			fprintf(fp, "---<Nested NMI>---\n");
+			break;
 		}
 
 		/*
@@ -2330,6 +2495,22 @@ ppc64_vmcore_stack_frame(struct bt_info *bt_in, ulong *nip, ulong *ksp)
 
 	pt_regs = (struct ppc64_pt_regs *)bt_in->machdep;
 	if (!pt_regs || !pt_regs->gpr[1]) {
+		if (bt_in->hp) {
+			if (bt_in->hp->esp) {
+				*ksp = bt_in->hp->esp;
+				if (!bt_in->hp->eip) {
+					if (IS_KVADDR(*ksp)) {
+						readmem(*ksp+16, KVADDR, &unip, sizeof(ulong),
+							"Regs NIP value", FAULT_ON_ERROR);
+						*nip = unip;
+					}
+				} else
+					*nip = bt_in->hp->eip;
+
+			}
+			return TRUE;
+		}
+
 		/*
 		 * Not collected regs. May be the corresponding CPU not
 		 * responded to an IPI in case of KDump OR f/w has not
@@ -2409,6 +2590,9 @@ ppc64_get_dumpfile_stack_frame(struct bt_info *bt_in, ulong *nip, ulong *ksp)
 		pt_regs = (struct ppc64_pt_regs *)bt->machdep;
 		ur_nip = pt_regs->nip;
 		ur_ksp = pt_regs->gpr[1];
+		/* Print the collected regs for panic task. */
+		ppc64_print_regs(pt_regs);
+		ppc64_print_nip_lr(pt_regs, 1);
 	} else if ((pc->flags & KDUMP) ||
 		   ((pc->flags & DISKDUMP) &&
 		    (*diskdump_flags & KDUMP_CMPRS_LOCAL))) {
@@ -2539,7 +2723,7 @@ retry:
 		goto retry;
 	} 
 
-	if (check_intrstack && ms->hwintrstack[bt->tc->processor]) {
+	if (check_intrstack && ms->hwintrstack) {
 		bt->stacktop = ms->hwintrstack[bt->tc->processor] +
 			sizeof(ulong);
 		bt->stackbase = ms->hwintrstack[bt->tc->processor] -
@@ -2975,6 +3159,44 @@ opalmsg(void)
 		fprintf(fp, "\n");
 }
 
+static void ppc64_print_emergency_stack_info(void)
+{
+	struct machine_specific *ms = machdep->machspec;
+	char buf[32];
+	int i;
+
+	fprintf(fp, "    EMERGENCY STACK: ");
+	if (ms->emergency_sp) {
+		fprintf(fp, "\n");
+		for (i = 0; i < kt->cpus; i++) {
+			sprintf(buf, "CPU %d", i);
+			fprintf(fp, "%19s: %lx\n", buf, ms->emergency_sp[i]);
+		}
+	} else
+		fprintf(fp, "(unused)\n");
+
+	fprintf(fp, "NMI EMERGENCY STACK: ");
+	if (ms->nmi_emergency_sp) {
+		fprintf(fp, "\n");
+		for (i = 0; i < kt->cpus; i++) {
+			sprintf(buf, "CPU %d", i);
+			fprintf(fp, "%19s: %lx\n", buf, ms->nmi_emergency_sp[i]);
+		}
+	} else
+		fprintf(fp, "(unused)\n");
+
+	fprintf(fp, " MC EMERGENCY STACK: ");
+	if (ms->mc_emergency_sp) {
+		fprintf(fp, "\n");
+		for (i = 0; i < kt->cpus; i++) {
+			sprintf(buf, "CPU %d", i);
+			fprintf(fp, "%19s: %lx\n", buf, ms->mc_emergency_sp[i]);
+		}
+	} else
+		fprintf(fp, "(unused)\n");
+	fprintf(fp, "\n");
+}
+
 /*
  *  Machine dependent command.
  */
@@ -3055,6 +3277,8 @@ ppc64_display_machine_stats(void)
 			fprintf(fp, "%19s: %lx\n", buf, tt->softirq_ctx[c]);
 		}
 	}
+
+	ppc64_print_emergency_stack_info();
 }
 
 static const char *hook_files[] = {
@@ -3278,7 +3502,7 @@ parse_cmdline_args(void)
  * Initialize the per cpu data_offset values from paca structure.
  */
 static int
-ppc64_paca_init(int map)
+ppc64_paca_percpu_offset_init(int map)
 {
 	int i, cpus, nr_paca;
 	char *cpu_paca_buf;
@@ -3380,10 +3604,11 @@ ppc64_init_cpu_info(void)
 	 * which was removed post v2.6.15 ppc64 and now we get the per cpu
 	 * data_offset from __per_cpu_offset symbol during kernel_init()
 	 * call. Hence for backward (pre-2.6.36) compatibility, call
-	 * ppc64_paca_init() only if symbol __per_cpu_offset does not exist.
+	 * ppc64_paca_percpu_offset_init() only if symbol __per_cpu_offset
+	 * does not exist.
 	 */
 	if (!symbol_exists("__per_cpu_offset"))
-		cpus = ppc64_paca_init(map);
+		cpus = ppc64_paca_percpu_offset_init(map);
 	else {
 		if (!(nr_cpus = get_array_length("__per_cpu_offset", NULL, 0)))
 			nr_cpus = (kt->kernel_NR_CPUS ? kt->kernel_NR_CPUS :
