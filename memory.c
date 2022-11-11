@@ -4714,18 +4714,29 @@ get_task_mem_usage(ulong task, struct task_mem_usage *tm)
 		 *  Latest kernels have mm_struct.mm_rss_stat[].
 		 */ 
 		if (VALID_MEMBER(mm_struct_rss_stat)) {
-			long anonpages, filepages;
+			long anonpages, filepages, count;
 
 			anonpages = tt->anonpages;
 			filepages = tt->filepages;
-			rss += LONG(tt->mm_struct +
+			count = LONG(tt->mm_struct +
 				OFFSET(mm_struct_rss_stat) +
 				OFFSET(mm_rss_stat_count) +
 				(filepages * sizeof(long)));
-			rss += LONG(tt->mm_struct +
+
+			/*
+			 * The counter is updated in asynchronous manner
+			 * and may become negative, see:
+			 * include/linux/mm.h: get_mm_counter()
+			 */
+			if (count > 0)
+				rss += count;
+
+			count = LONG(tt->mm_struct +
 				OFFSET(mm_struct_rss_stat) +
 				OFFSET(mm_rss_stat_count) +
 				(anonpages * sizeof(long)));
+			if (count > 0)
+				rss += count;
 		}
 
 		/* Check whether SPLIT_RSS_COUNTING is enabled */
@@ -4769,7 +4780,8 @@ get_task_mem_usage(ulong task, struct task_mem_usage *tm)
 							RETURN_ON_ERROR))
 								continue;
 
-						rss_cache += sync_rss;
+						if (sync_rss > 0)
+							rss_cache += sync_rss;
 
 						/* count 1 -> anonpages */
 						if (!readmem(first->task +
@@ -4782,7 +4794,8 @@ get_task_mem_usage(ulong task, struct task_mem_usage *tm)
 							RETURN_ON_ERROR))
 								continue;
 
-						rss_cache += sync_rss;
+						if (sync_rss > 0)
+							rss_cache += sync_rss;
 
 						if (first == last)
 							break;
@@ -6599,7 +6612,7 @@ page_flags_init_from_pageflag_names(void)
 		}
 
 		if (!read_string((ulong)name, namebuf, BUFSIZE-1)) {
-			error(INFO, "failed to read pageflag_names entry (i: %d  name: \"%s\"  mask: %ld)\n",
+			error(INFO, "failed to read pageflag_names entry (i: %d  name: %lx  mask: %lx)\n",
 				i, name, mask);
 			goto pageflags_fail;
 		}
@@ -8861,7 +8874,7 @@ dump_vmlist(struct meminfo *vi)
 				    (vi->spec_addr < (paddr+PAGESIZE()))) {
 					if (vi->flags & GET_PHYS_TO_VMALLOC) {
 						vi->retval = pcheck +
-						    PAGEOFFSET(paddr);
+						    PAGEOFFSET(vi->spec_addr);
 						return;
 				        } else
 						fprintf(fp,
@@ -9010,7 +9023,7 @@ dump_vmap_area(struct meminfo *vi)
 				    (vi->spec_addr < (paddr+PAGESIZE()))) {
 					if (vi->flags & GET_PHYS_TO_VMALLOC) {
 						vi->retval = pcheck +
-						    PAGEOFFSET(paddr);
+						    PAGEOFFSET(vi->spec_addr);
 						FREEBUF(ld->list_ptr);
 						return;
 				        } else
@@ -13477,6 +13490,10 @@ kmem_search(struct meminfo *mi)
 	 *  Check for a valid mapped address.
 	 */
 	if ((mi->memtype == KVADDR) && IS_VMALLOC_ADDR(mi->spec_addr)) {
+		if ((task = stkptr_to_task(vaddr)) && (tc = task_to_context(task))) {
+			show_context(tc);
+			fprintf(fp, "\n");
+		}
 		if (kvtop(NULL, mi->spec_addr, &paddr, 0)) {
 			mi->flags = orig_flags | VMLIST_VERIFY;
 			dump_vmlist(mi);
@@ -13502,6 +13519,10 @@ kmem_search(struct meminfo *mi)
 		mi->flags &= ~GET_PHYS_TO_VMALLOC;
 
 		if (mi->retval) {
+			if ((task = stkptr_to_task(mi->retval)) && (tc = task_to_context(task))) {
+				show_context(tc);
+				fprintf(fp, "\n");
+			}
 			if ((sp = value_search(mi->retval, &offset))) {
                         	show_symbol(sp, offset, 
 					SHOW_LINENUM | SHOW_RADIX());
@@ -13558,11 +13579,11 @@ kmem_search(struct meminfo *mi)
 	/*
 	 *  Check whether it's a current task or stack address.
 	 */
-	if ((mi->memtype == KVADDR) && (task = vaddr_in_task_struct(vaddr)) &&
+	if ((mi->memtype & (KVADDR|PHYSADDR)) && (task = vaddr_in_task_struct(vaddr)) &&
 	    (tc = task_to_context(task))) {
 		show_context(tc);
 		fprintf(fp, "\n");
-	} else if ((mi->memtype == KVADDR) && (task = stkptr_to_task(vaddr)) &&
+	} else if ((mi->memtype & (KVADDR|PHYSADDR)) && (task = stkptr_to_task(vaddr)) &&
 	    (tc = task_to_context(task))) {
 		show_context(tc);
 		fprintf(fp, "\n");
