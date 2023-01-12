@@ -76,7 +76,7 @@
 #if !defined(X86) && !defined(X86_64) && !defined(ALPHA) && !defined(PPC) && \
     !defined(IA64) && !defined(PPC64) && !defined(S390) && !defined(S390X) && \
     !defined(ARM) && !defined(ARM64) && !defined(MIPS) && !defined(MIPS64) && \
-    !defined(SPARC64)
+    !defined(RISCV64) && !defined(SPARC64)
 #ifdef __alpha__
 #define ALPHA
 #endif
@@ -118,6 +118,9 @@
 #ifdef __sparc_v9__
 #define SPARC64
 #endif
+#if defined(__riscv) && (__riscv_xlen == 64)
+#define RISCV64
+#endif
 #endif
 
 #ifdef X86
@@ -158,6 +161,9 @@
 #endif
 #ifdef SPARC64
 #define NR_CPUS  (4096)
+#endif
+#ifdef RISCV64
+#define NR_CPUS  (256)
 #endif
 
 #define NR_DEVICE_DUMPS (64)
@@ -2181,6 +2187,23 @@ struct offset_table {                    /* stash of commonly-used offsets */
 	long blk_mq_tags_nr_reserved_tags;
 	long blk_mq_tags_rqs;
 	long request_queue_hctx_table;
+	long percpu_counter_counters;
+	long slab_slab_list;
+	long mm_struct_mm_mt;
+	long maple_tree_ma_root;
+	long maple_tree_ma_flags;
+	long maple_node_parent;
+	long maple_node_ma64;
+	long maple_node_mr64;
+	long maple_node_slot;
+	long maple_arange_64_pivot;
+	long maple_arange_64_slot;
+	long maple_arange_64_gap;
+	long maple_arange_64_meta;
+	long maple_range_64_pivot;
+	long maple_range_64_slot;
+	long maple_metadata_end;
+	long maple_metadata_gap;
 };
 
 struct size_table {         /* stash of commonly-used sizes */
@@ -2351,6 +2374,9 @@ struct size_table {         /* stash of commonly-used sizes */
 	long sbitmap_queue;
 	long sbq_wait_state;
 	long blk_mq_tags;
+	long percpu_counter;
+	long maple_tree;
+	long maple_node;
 };
 
 struct array_table {
@@ -2687,6 +2713,7 @@ struct tree_data {
 #define TREE_PARSE_MEMBER         (VERBOSE << 7)
 #define TREE_READ_MEMBER          (VERBOSE << 8)
 #define TREE_LINEAR_ORDER         (VERBOSE << 9)
+#define TREE_STRUCT_VERBOSE       (VERBOSE << 10)
 
 #define ALIAS_RUNTIME  (1)
 #define ALIAS_RCLOCAL  (2)
@@ -3483,6 +3510,154 @@ struct arm64_stackframe {
 #define _SECTION_SIZE_BITS      28
 #define _MAX_PHYSMEM_BITS       48
 #endif  /* MIPS64 */
+
+#ifndef EM_RISCV
+#define EM_RISCV		243
+#endif
+
+#ifdef RISCV64
+#define _64BIT_
+#define MACHINE_TYPE		"RISCV64"
+
+typedef struct { ulong pgd; } pgd_t;
+typedef struct { ulong p4d; } p4d_t;
+typedef struct { ulong pud; } pud_t;
+typedef struct { ulong pmd; } pmd_t;
+typedef struct { ulong pte; } pte_t;
+typedef signed int s32;
+
+/* arch/riscv/include/asm/pgtable-64.h */
+#define PGD_SHIFT_L3		(30)
+#define PGD_SHIFT_L4		(39)
+#define PGD_SHIFT_L5		(48)
+
+#define P4D_SHIFT		(39)
+#define PUD_SHIFT		(30)
+#define PMD_SHIFT		(21)
+
+#define PTRS_PER_PGD		(512)
+#define PTRS_PER_P4D		(512)
+#define PTRS_PER_PUD		(512)
+#define PTRS_PER_PMD		(512)
+#define PTRS_PER_PTE		(512)
+
+/*
+ * Mask for bit 0~53(PROT and PPN) of PTE
+ * 63 6261  60    54  53 10  9 8 7 6 5 4 3 2 1 0
+ * N  PBMT  Reserved  P P N  RSW D A G U X W R V
+ */
+#define PTE_PFN_PROT_MASK	0x3FFFFFFFFFFFFF
+
+/*
+ * 3-levels / 4K pages
+ *
+ * sv39
+ * PGD  |  PMD  |  PTE  |  OFFSET  |
+ *  9   |   9   |   9   |    12    |
+ */
+#define pgd_index_l3_4k(addr) (((addr) >> PGD_SHIFT_L3) & (PTRS_PER_PGD - 1))
+#define pmd_index_l3_4k(addr) (((addr) >> PMD_SHIFT) & (PTRS_PER_PMD - 1))
+#define pte_index_l3_4k(addr) (((addr) >> PAGESHIFT()) & (PTRS_PER_PTE - 1))
+
+/*
+ * 4-levels / 4K pages
+ *
+ * sv48
+ * PGD  |  PUD  |  PMD  |   PTE   |  OFFSET  |
+ *  9   |   9   |   9   |    9    |    12    |
+ */
+#define pgd_index_l4_4k(addr) (((addr) >> PGD_SHIFT_L4) & (PTRS_PER_PGD - 1))
+#define pud_index_l4_4k(addr) (((addr) >> PUD_SHIFT) & (PTRS_PER_PUD - 1))
+#define pmd_index_l4_4k(addr) (((addr) >> PMD_SHIFT) & (PTRS_PER_PMD - 1))
+#define pte_index_l4_4k(addr) (((addr) >> PAGESHIFT()) & (PTRS_PER_PTE - 1))
+
+/*
+ * 5-levels / 4K pages
+ *
+ * sv57
+ * PGD  |  P4D  |  PUD  |  PMD  |   PTE   |  OFFSET  |
+ *  9   |   9   |   9   |   9   |    9    |    12    |
+ */
+#define pgd_index_l5_4k(addr) (((addr) >> PGD_SHIFT_L5) & (PTRS_PER_PGD - 1))
+#define p4d_index_l5_4k(addr) (((addr) >> P4D_SHIFT) & (PTRS_PER_P4D - 1))
+#define pud_index_l5_4k(addr) (((addr) >> PUD_SHIFT) & (PTRS_PER_PUD - 1))
+#define pmd_index_l5_4k(addr) (((addr) >> PMD_SHIFT) & (PTRS_PER_PMD - 1))
+#define pte_index_l5_4k(addr) (((addr) >> PAGESHIFT()) & (PTRS_PER_PTE - 1))
+
+#define VM_L3_4K	(0x2)
+#define VM_L3_2M	(0x4)
+#define VM_L3_1G	(0x8)
+#define VM_L4_4K	(0x10)
+#define VM_L4_2M	(0x20)
+#define VM_L4_1G	(0x40)
+#define VM_L5_4K	(0x80)
+#define VM_L5_2M	(0x100)
+#define VM_L5_1G	(0x200)
+
+#define VM_FLAGS	(VM_L3_4K | VM_L3_2M | VM_L3_1G | \
+			 VM_L4_4K | VM_L4_2M | VM_L4_1G | \
+			 VM_L5_4K | VM_L5_2M | VM_L5_1G)
+
+/*
+ * Direct memory mapping
+ */
+#define PTOV(X) 									\
+	(((unsigned long)(X)+(machdep->kvbase)) - machdep->machspec->phys_base)
+#define VTOP(X) ({									\
+	ulong _X = X;									\
+	(THIS_KERNEL_VERSION >= LINUX(5,13,0) &&					\
+		(_X) >= machdep->machspec->kernel_link_addr) ?				\
+		(((unsigned long)(_X)-(machdep->machspec->kernel_link_addr)) +		\
+		 machdep->machspec->phys_base):						\
+		(((unsigned long)(_X)-(machdep->kvbase)) +				\
+		 machdep->machspec->phys_base);						\
+	})
+#define PAGEBASE(X)		(((ulong)(X)) & (ulong)machdep->pagemask)
+
+/*
+ * Stack size order
+ */
+#define THREAD_SIZE_ORDER	2
+
+#define PAGE_OFFSET		(machdep->machspec->page_offset)
+#define VMALLOC_START		(machdep->machspec->vmalloc_start_addr)
+#define VMALLOC_END		(machdep->machspec->vmalloc_end)
+#define VMEMMAP_VADDR		(machdep->machspec->vmemmap_vaddr)
+#define VMEMMAP_END		(machdep->machspec->vmemmap_end)
+#define MODULES_VADDR		(machdep->machspec->modules_vaddr)
+#define MODULES_END		(machdep->machspec->modules_end)
+#define IS_VMALLOC_ADDR(X)	riscv64_IS_VMALLOC_ADDR((ulong)(X))
+
+/* from arch/riscv/include/asm/pgtable.h */
+#define __SWP_TYPE_SHIFT	6
+#define __SWP_TYPE_BITS 	5
+#define __SWP_TYPE_MASK 	((1UL << __SWP_TYPE_BITS) - 1)
+#define __SWP_OFFSET_SHIFT	(__SWP_TYPE_BITS + __SWP_TYPE_SHIFT)
+
+#define MAX_SWAPFILES_CHECK()	BUILD_BUG_ON(MAX_SWAPFILES_SHIFT > __SWP_TYPE_BITS)
+
+#define SWP_TYPE(entry) 	(((entry) >> __SWP_TYPE_SHIFT) & __SWP_TYPE_MASK)
+#define SWP_OFFSET(entry)	((entry) >> __SWP_OFFSET_SHIFT)
+#define __swp_type(entry)	SWP_TYPE(entry)
+#define __swp_offset(entry)	SWP_OFFSET(entry)
+
+#define TIF_SIGPENDING		(THIS_KERNEL_VERSION >= LINUX(2,6,23) ? 1 : 2)
+
+/* from arch/riscv/include/asm/sparsemem.h */
+#define _SECTION_SIZE_BITS	27
+#define _MAX_PHYSMEM_BITS	56 /* 56-bit physical address supported */
+#define PHYS_MASK_SHIFT 	_MAX_PHYSMEM_BITS
+#define PHYS_MASK		(((1UL) << PHYS_MASK_SHIFT) - 1)
+
+#define IS_LAST_P4D_READ(p4d)	((ulong)(p4d) == machdep->machspec->last_p4d_read)
+#define FILL_P4D(P4D, TYPE, SIZE)					      \
+    if (!IS_LAST_P4D_READ(P4D)) {					      \
+	    readmem((ulonglong)((ulong)(P4D)), TYPE, machdep->machspec->p4d,  \
+		     SIZE, "p4d page", FAULT_ON_ERROR);                       \
+	    machdep->machspec->last_p4d_read = (ulong)(P4D);                  \
+    }
+
+#endif  /* RISCV64 */
 
 #ifdef X86
 #define _32BIT_
@@ -4532,6 +4707,10 @@ struct machine_specific {
 #define MAX_HEXADDR_STRLEN (16)
 #define UVADDR_PRLEN      (16)
 #endif
+#ifdef RISCV64
+#define MAX_HEXADDR_STRLEN (16)
+#define UVADDR_PRLEN       (16)
+#endif
 
 #define BADADDR  ((ulong)(-1))
 #define BADVAL   ((ulong)(-1))
@@ -5147,6 +5326,9 @@ void dump_build_data(void);
 #ifdef MIPS64
 #define machdep_init(X) mips64_init(X)
 #endif
+#ifdef RISCV64
+#define machdep_init(X) riscv64_init(X)
+#endif
 #ifdef SPARC64
 #define machdep_init(X) sparc64_init(X)
 #endif
@@ -5325,6 +5507,7 @@ struct rb_node *rb_right(struct rb_node *, struct rb_node *);
 struct rb_node *rb_left(struct rb_node *, struct rb_node *);
 struct rb_node *rb_next(struct rb_node *);
 struct rb_node *rb_last(struct rb_root *);
+long percpu_counter_sum_positive(ulong fbc);
 
 /* 
  *  symbols.c 
@@ -5577,6 +5760,14 @@ int file_dump(ulong, ulong, ulong, int, int);
 int same_file(char *, char *);
 int cleanup_memory_driver(void);
 
+void maple_init(void);
+int do_mptree(struct tree_data *);
+ulong do_maple_tree(ulong, int, struct list_pair *);
+#define MAPLE_TREE_COUNT   (1)
+#define MAPLE_TREE_SEARCH  (2)
+#define MAPLE_TREE_DUMP    (3)
+#define MAPLE_TREE_GATHER  (4)
+#define MAPLE_TREE_DUMP_CB (5)
 
 /*
  *  help.c 
@@ -5626,6 +5817,9 @@ void display_help_screen(char *);
 #endif
 #ifdef SPARC64
 #define dump_machdep_table(X) sparc64_dump_machdep_table(X)
+#endif
+#ifdef RISCV64
+#define dump_machdep_table(X) riscv64_dump_machdep_table(X)
 #endif
 extern char *help_pointer[];
 extern char *help_alias[];
@@ -6703,6 +6897,95 @@ struct machine_specific {
 #define _PFN_SHIFT	(machdep->machspec->_pfn_shift)
 
 #endif /* MIPS64 */
+
+/*
+ * riscv64.c
+ */
+void riscv64_display_regs_from_elf_notes(int, FILE *);
+
+#ifdef RISCV64
+void riscv64_init(int);
+void riscv64_dump_machdep_table(ulong);
+int riscv64_IS_VMALLOC_ADDR(ulong);
+
+#define display_idt_table() \
+	error(FATAL, "-d option is not applicable to RISCV64 architecture\n")
+
+/* from arch/riscv/include/asm/ptrace.h */
+struct riscv64_register {
+	ulong regs[36];
+};
+
+struct riscv64_pt_regs {
+	ulong badvaddr;
+	ulong cause;
+	ulong epc;
+};
+
+struct riscv64_unwind_frame {
+	ulong fp;
+	ulong sp;
+	ulong pc;
+};
+
+#define KSYMS_START	(0x1)
+
+struct machine_specific {
+	ulong phys_base;
+	ulong page_offset;
+	ulong vmalloc_start_addr;
+	ulong vmalloc_end;
+	ulong vmemmap_vaddr;
+	ulong vmemmap_end;
+	ulong modules_vaddr;
+	ulong modules_end;
+	ulong kernel_link_addr;
+
+	ulong _page_present;
+	ulong _page_read;
+	ulong _page_write;
+	ulong _page_exec;
+	ulong _page_user;
+	ulong _page_global;
+	ulong _page_accessed;
+	ulong _page_dirty;
+	ulong _page_soft;
+
+	ulong _pfn_shift;
+	ulong va_bits;
+	char *p4d;
+	ulong last_p4d_read;
+	ulong struct_page_size;
+
+	struct riscv64_register *crash_task_regs;
+};
+/* from arch/riscv/include/asm/pgtable-bits.h */
+#define _PAGE_PRESENT	(machdep->machspec->_page_present)
+#define _PAGE_READ	(machdep->machspec->_page_read)
+#define _PAGE_WRITE	(machdep->machspec->_page_write)
+#define _PAGE_EXEC	(machdep->machspec->_page_exec)
+#define _PAGE_USER	(machdep->machspec->_page_user)
+#define _PAGE_GLOBAL	(machdep->machspec->_page_global)
+#define _PAGE_ACCESSED	(machdep->machspec->_page_accessed)
+#define _PAGE_DIRTY	(machdep->machspec->_page_dirty)
+#define _PAGE_SOFT	(machdep->machspec->_page_soft)
+#define _PAGE_SEC	(machdep->machspec->_page_sec)
+#define _PAGE_SHARE	(machdep->machspec->_page_share)
+#define _PAGE_BUF	(machdep->machspec->_page_buf)
+#define _PAGE_CACHE	(machdep->machspec->_page_cache)
+#define _PAGE_SO	(machdep->machspec->_page_so)
+#define _PAGE_SPECIAL	_PAGE_SOFT
+#define _PAGE_TABLE	_PAGE_PRESENT
+#define _PAGE_PROT_NONE _PAGE_READ
+#define _PAGE_PFN_SHIFT 10
+
+/* from 'struct pt_regs' definitions of RISC-V arch */
+#define RISCV64_REGS_EPC  0
+#define RISCV64_REGS_RA   1
+#define RISCV64_REGS_SP   2
+#define RISCV64_REGS_FP   8
+
+#endif /* RISCV64 */
 
 /*
  * sparc64.c

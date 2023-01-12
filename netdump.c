@@ -42,6 +42,7 @@ static void get_netdump_regs_ppc64(struct bt_info *, ulong *, ulong *);
 static void get_netdump_regs_arm(struct bt_info *, ulong *, ulong *);
 static void get_netdump_regs_arm64(struct bt_info *, ulong *, ulong *);
 static void get_netdump_regs_mips(struct bt_info *, ulong *, ulong *);
+static void get_netdump_regs_riscv(struct bt_info *, ulong *, ulong *);
 static void check_dumpfile_size(char *);
 static int proc_kcore_init_32(FILE *, int);
 static int proc_kcore_init_64(FILE *, int);
@@ -296,6 +297,12 @@ is_netdump(char *file, ulong source_query)
 
 		case EM_MIPS:
 			if (machine_type_mismatch(file, "MIPS", "MIPS64",
+			    source_query))
+				goto bailout;
+			break;
+
+		case EM_RISCV:
+			if (machine_type_mismatch(file, "RISCV64", NULL,
 			    source_query))
 				goto bailout;
 			break;
@@ -2669,6 +2676,10 @@ get_netdump_regs(struct bt_info *bt, ulong *eip, ulong *esp)
 		return get_netdump_regs_mips(bt, eip, esp);
 		break;
 
+	case EM_RISCV:
+		get_netdump_regs_riscv(bt, eip, esp);
+		break;
+
 	default:
 		error(FATAL, 
 		   "support for ELF machine type %d not available\n",
@@ -2925,6 +2936,8 @@ display_regs_from_elf_notes(int cpu, FILE *ofp)
 		mips_display_regs_from_elf_notes(cpu, ofp);
 	} else if (machine_type("MIPS64")) {
 		mips64_display_regs_from_elf_notes(cpu, ofp);
+	} else if (machine_type("RISCV64")) {
+		riscv64_display_regs_from_elf_notes(cpu, ofp);
 	}
 }
 
@@ -2935,7 +2948,8 @@ dump_registers_for_elf_dumpfiles(void)
 
         if (!(machine_type("X86") || machine_type("X86_64") || 
 	    machine_type("ARM64") || machine_type("PPC64") ||
-	    machine_type("MIPS") || machine_type("MIPS64")))
+	    machine_type("MIPS") || machine_type("MIPS64") ||
+	    machine_type("RISCV64")))
                 error(FATAL, "-r option not supported for this dumpfile\n");
 
 	if (NETDUMP_DUMPFILE()) {
@@ -3866,6 +3880,12 @@ get_netdump_regs_arm64(struct bt_info *bt, ulong *eip, ulong *esp)
 
 static void
 get_netdump_regs_mips(struct bt_info *bt, ulong *eip, ulong *esp)
+{
+	machdep->get_stack_frame(bt, eip, esp);
+}
+
+static void
+get_netdump_regs_riscv(struct bt_info *bt, ulong *eip, ulong *esp)
 {
 	machdep->get_stack_frame(bt, eip, esp);
 }

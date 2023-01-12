@@ -3743,6 +3743,11 @@ is_kernel(char *file)
 				goto bailout;
 			break;
 
+		case EM_RISCV:
+			if (machine_type_mismatch(file, "RISCV64", NULL, 0))
+				goto bailout;
+			break;
+
 		default:
 			if (machine_type_mismatch(file, "(unknown)", NULL, 0))
 				goto bailout;
@@ -4000,6 +4005,11 @@ is_shared_object(char *file)
 
 		case EM_MIPS:
 			if (machine_type("MIPS64"))
+				return TRUE;
+			break;
+
+		case EM_RISCV:
+			if (machine_type("RISCV64"))
 				return TRUE;
 			break;
 		}
@@ -9700,6 +9710,7 @@ dump_offset_table(char *spec, ulong makestruct)
                 OFFSET(slab_inuse));
         fprintf(fp, "                     slab_free: %ld\n",
                 OFFSET(slab_free));
+        fprintf(fp, "                slab_slab_list: %ld\n", OFFSET(slab_slab_list));
 
         fprintf(fp, "               kmem_cache_size: %ld\n",
                 OFFSET(kmem_cache_size));
@@ -10633,8 +10644,8 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(ktime_t_nsec));
 	fprintf(fp, "              atomic_t_counter: %ld\n",
 		OFFSET(atomic_t_counter));
-	fprintf(fp, "          percpu_counter_count: %ld\n",
-		OFFSET(percpu_counter_count));
+	fprintf(fp, "          percpu_counter_count: %ld\n", OFFSET(percpu_counter_count));
+	fprintf(fp, "       percpu_counter_counters: %ld\n", OFFSET(percpu_counter_counters));
 	fprintf(fp, "             sk_buff_head_next: %ld\n",
 		OFFSET(sk_buff_head_next));
 	fprintf(fp, "             sk_buff_head_qlen: %ld\n",
@@ -10755,6 +10766,21 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(sbq_wait_state_wait_cnt));
 	fprintf(fp, "           sbq_wait_state_wait: %ld\n",
 		OFFSET(sbq_wait_state_wait));
+	fprintf(fp, "               mm_struct_mm_mt: %ld\n", OFFSET(mm_struct_mm_mt));
+	fprintf(fp, "            maple_tree_ma_root: %ld\n", OFFSET(maple_tree_ma_root));
+	fprintf(fp, "           maple_tree_ma_flags: %ld\n", OFFSET(maple_tree_ma_flags));
+	fprintf(fp, "             maple_node_parent: %ld\n", OFFSET(maple_node_parent));
+	fprintf(fp, "               maple_node_ma64: %ld\n", OFFSET(maple_node_ma64));
+	fprintf(fp, "               maple_node_mr64: %ld\n", OFFSET(maple_node_mr64));
+	fprintf(fp, "               maple_node_slot: %ld\n", OFFSET(maple_node_slot));
+	fprintf(fp, "         maple_arange_64_pivot: %ld\n", OFFSET(maple_arange_64_pivot));
+	fprintf(fp, "          maple_arange_64_slot: %ld\n", OFFSET(maple_arange_64_slot));
+	fprintf(fp, "           maple_arange_64_gap: %ld\n", OFFSET(maple_arange_64_gap));
+	fprintf(fp, "          maple_arange_64_meta: %ld\n", OFFSET(maple_arange_64_meta));
+	fprintf(fp, "          maple_range_64_pivot: %ld\n", OFFSET(maple_range_64_pivot));
+	fprintf(fp, "           maple_range_64_slot: %ld\n", OFFSET(maple_range_64_slot));
+	fprintf(fp, "            maple_metadata_end: %ld\n", OFFSET(maple_metadata_end));
+	fprintf(fp, "            maple_metadata_gap: %ld\n", OFFSET(maple_metadata_gap));
 
 	fprintf(fp, "\n                    size_table:\n");
 	fprintf(fp, "                          page: %ld\n", SIZE(page));
@@ -11027,6 +11053,10 @@ dump_offset_table(char *spec, ulong makestruct)
 	fprintf(fp, "                 sbitmap_queue: %ld\n", SIZE(sbitmap_queue));
 	fprintf(fp, "                sbq_wait_state: %ld\n", SIZE(sbq_wait_state));
 	fprintf(fp, "                   blk_mq_tags: %ld\n", SIZE(blk_mq_tags));
+	fprintf(fp, "                    maple_tree: %ld\n", SIZE(maple_tree));
+	fprintf(fp, "                    maple_node: %ld\n", SIZE(maple_node));
+
+	fprintf(fp, "                percpu_counter: %ld\n", SIZE(percpu_counter));
 
         fprintf(fp, "\n                   array_table:\n");
 	/*

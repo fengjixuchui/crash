@@ -59,12 +59,13 @@ IBM_HFILES=ibm_common.h
 SADUMP_HFILES=sadump.h
 UNWIND_HFILES=unwind.h unwind_i.h rse.h unwind_x86.h unwind_x86_64.h
 VMWARE_HFILES=vmware_vmss.h
+MAPLE_TREE_HFILES=maple_tree.h
 
 CFILES=main.c tools.c global_data.c memory.c filesys.c help.c task.c \
 	kernel.c test.c gdb_interface.c configure.c net.c dev.c bpf.c \
 	printk.c \
 	alpha.c x86.c ppc.c ia64.c s390.c s390x.c s390dbf.c ppc64.c x86_64.c \
-	arm.c arm64.c mips.c mips64.c sparc64.c \
+	arm.c arm64.c mips.c mips64.c riscv64.c sparc64.c \
 	extensions.c remote.c va_server.c va_server_v1.c symbols.c cmdline.c \
 	lkcd_common.c lkcd_v1.c lkcd_v2_v3.c lkcd_v5.c lkcd_v7.c lkcd_v8.c\
 	lkcd_fix_mem.c s390_dump.c lkcd_x86_trace.c \
@@ -73,18 +74,18 @@ CFILES=main.c tools.c global_data.c memory.c filesys.c help.c task.c \
 	xen_hyper.c xen_hyper_command.c xen_hyper_global_data.c \
 	xen_hyper_dump_tables.c kvmdump.c qemu.c qemu-load.c sadump.c ipcs.c \
 	ramdump.c vmware_vmss.c vmware_guestdump.c \
-	xen_dom0.c kaslr_helper.c sbitmap.c
+	xen_dom0.c kaslr_helper.c sbitmap.c maple_tree.c
 
 SOURCE_FILES=${CFILES} ${GENERIC_HFILES} ${MCORE_HFILES} \
 	${REDHAT_CFILES} ${REDHAT_HFILES} ${UNWIND_HFILES} \
 	${LKCD_DUMP_HFILES} ${LKCD_TRACE_HFILES} ${LKCD_OBSOLETE_HFILES}\
-	${IBM_HFILES} ${SADUMP_HFILES} ${VMWARE_HFILES}
+	${IBM_HFILES} ${SADUMP_HFILES} ${VMWARE_HFILES} ${MAPLE_TREE_HFILES}
 
 OBJECT_FILES=main.o tools.o global_data.o memory.o filesys.o help.o task.o \
 	build_data.o kernel.o test.o gdb_interface.o net.o dev.o bpf.o \
 	printk.o \
 	alpha.o x86.o ppc.o ia64.o s390.o s390x.o s390dbf.o ppc64.o x86_64.o \
-	arm.o arm64.o mips.o mips64.o sparc64.o \
+	arm.o arm64.o mips.o mips64.o riscv64.o sparc64.o \
 	extensions.o remote.o va_server.o va_server_v1.o symbols.o cmdline.o \
 	lkcd_common.o lkcd_v1.o lkcd_v2_v3.o lkcd_v5.o lkcd_v7.o lkcd_v8.o \
 	lkcd_fix_mem.o s390_dump.o netdump.o diskdump.o makedumpfile.o xendump.o \
@@ -93,7 +94,7 @@ OBJECT_FILES=main.o tools.o global_data.o memory.o filesys.o help.o task.o \
 	xen_hyper.o xen_hyper_command.o xen_hyper_global_data.o \
 	xen_hyper_dump_tables.o kvmdump.o qemu.o qemu-load.o sadump.o ipcs.o \
 	ramdump.o vmware_vmss.o vmware_guestdump.o \
-	xen_dom0.o kaslr_helper.o sbitmap.o
+	xen_dom0.o kaslr_helper.o sbitmap.o maple_tree.o
 
 MEMORY_DRIVER_FILES=memory_driver/Makefile memory_driver/crash.c memory_driver/README
 
@@ -354,7 +355,7 @@ filesys.o: ${GENERIC_HFILES} filesys.c
 help.o: ${GENERIC_HFILES} help.c
 	${CC} -c ${CRASH_CFLAGS} help.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
-memory.o: ${GENERIC_HFILES} memory.c
+memory.o: ${GENERIC_HFILES} ${MAPLE_TREE_HFILES} memory.c
 	${CC} -c ${CRASH_CFLAGS} memory.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 test.o: ${GENERIC_HFILES} test.c
@@ -437,6 +438,9 @@ mips.o: ${GENERIC_HFILES} ${REDHAT_HFILES} mips.c
 
 mips64.o: ${GENERIC_HFILES} ${REDHAT_HFILES} mips64.c
 	${CC} -c ${CRASH_CFLAGS} mips64.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+riscv64.o: ${GENERIC_HFILES} ${REDHAT_HFILES} riscv64.c
+	${CC} -c ${CRASH_CFLAGS} riscv64.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 sparc64.o: ${GENERIC_HFILES} ${REDHAT_HFILES} sparc64.c
 	${CC} -c ${CRASH_CFLAGS} sparc64.c ${WARNING_OPTIONS} ${WARNING_ERROR}
@@ -535,6 +539,9 @@ kaslr_helper.o: ${GENERIC_HFILES} kaslr_helper.c
 
 bpf.o: ${GENERIC_HFILES} bpf.c
 	${CC} -c ${CRASH_CFLAGS} bpf.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+maple_tree.o: ${GENERIC_HFILES} ${MAPLE_TREE_HFILES} maple_tree.c
+	${CC} -c ${CRASH_CFLAGS} maple_tree.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 ${PROGRAM}: force
 	@$(MAKE) all
