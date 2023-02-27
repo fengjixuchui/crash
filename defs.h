@@ -2204,6 +2204,10 @@ struct offset_table {                    /* stash of commonly-used offsets */
 	long maple_range_64_slot;
 	long maple_metadata_end;
 	long maple_metadata_gap;
+	long sock_sk_common;
+	long sock_common_skc_v6_daddr;
+	long sock_common_skc_v6_rcv_saddr;
+	long inactive_task_frame_bp;
 };
 
 struct size_table {         /* stash of commonly-used sizes */
@@ -2638,6 +2642,7 @@ struct vm_table {                /* kernel VM-related data */
 #define SLAB_OVERLOAD_PAGE    (0x8000000)
 #define SLAB_CPU_CACHE       (0x10000000)
 #define SLAB_ROOT_CACHES     (0x20000000)
+#define FREELIST_PTR_BSWAP   (0x40000000)
 
 #define IS_FLATMEM()		(vt->flags & FLATMEM)
 #define IS_DISCONTIGMEM()	(vt->flags & DISCONTIGMEM)

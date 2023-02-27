@@ -8822,6 +8822,7 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(task_struct_tss_ksp));
         fprintf(fp, "        task_struct_thread_eip: %ld\n",
                 OFFSET(task_struct_thread_eip));
+	fprintf(fp, "        inactive_task_frame_bp: %ld\n", OFFSET(inactive_task_frame_bp));
 	fprintf(fp, "  inactive_task_frame_ret_addr: %ld\n",
 		OFFSET(inactive_task_frame_ret_addr));
         fprintf(fp, "        task_struct_thread_esp: %ld\n",
@@ -9818,8 +9819,11 @@ dump_offset_table(char *spec, ulong makestruct)
 
         fprintf(fp, "                  sock_sk_type: %ld\n", 
 		OFFSET(sock_sk_type));
+	fprintf(fp, "                sock_sk_common: %ld\n", OFFSET(sock_sk_common));
         fprintf(fp, "        sock_common_skc_family: %ld\n", 
 		OFFSET(sock_common_skc_family));
+	fprintf(fp, "      sock_common_skc_v6_daddr: %ld\n", OFFSET(sock_common_skc_v6_daddr));
+	fprintf(fp, "  sock_common_skc_v6_rcv_saddr: %ld\n", OFFSET(sock_common_skc_v6_rcv_saddr));
 	fprintf(fp, "        socket_alloc_vfs_inode: %ld\n",
 		OFFSET(socket_alloc_vfs_inode));
         fprintf(fp, "                inet_sock_inet: %ld\n", 
