@@ -807,10 +807,10 @@ struct kernel_table {                   /* kernel data */
         }                                                            \
 }
 
-#define THIS_KERNEL_VERSION ((kt->kernel_version[0] << 16) + \
-			     (kt->kernel_version[1] << 8) + \
+#define THIS_KERNEL_VERSION ((kt->kernel_version[0] << 24) + \
+			     (kt->kernel_version[1] << 16) + \
 			     (kt->kernel_version[2]))
-#define LINUX(x,y,z) (((uint)(x) << 16) + ((uint)(y) << 8) + (uint)(z))
+#define LINUX(x,y,z) (((uint)(x) << 24) + ((uint)(y) << 16) + (uint)(z))
 
 #define THIS_GCC_VERSION    ((kt->gcc_version[0] << 16) + \
                              (kt->gcc_version[1] << 8) + \
@@ -2216,6 +2216,7 @@ struct offset_table {                    /* stash of commonly-used offsets */
 	long in6_addr_in6_u;
 	long kset_kobj;
 	long subsys_private_subsys;
+	long vmap_area_purge_list;
 };
 
 struct size_table {         /* stash of commonly-used sizes */
@@ -5521,6 +5522,7 @@ struct rb_node *rb_left(struct rb_node *, struct rb_node *);
 struct rb_node *rb_next(struct rb_node *);
 struct rb_node *rb_last(struct rb_root *);
 long percpu_counter_sum_positive(ulong fbc);
+ulong get_subsys_private(char *, char *);
 
 /* 
  *  symbols.c 
