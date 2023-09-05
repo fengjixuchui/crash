@@ -259,33 +259,12 @@ riscv64_processor_speed(void)
 static unsigned long riscv64_get_kernel_version(void)
 {
 	char *string;
-	char buf[BUFSIZE];
-	char *p1, *p2;
 
 	if (THIS_KERNEL_VERSION)
 		return THIS_KERNEL_VERSION;
 
-	string = pc->read_vmcoreinfo("OSRELEASE");
-	if (string) {
-		strcpy(buf, string);
-
-		p1 = p2 = buf;
-		while (*p2 != '.')
-			p2++;
-		*p2 = NULLCHAR;
-		kt->kernel_version[0] = atoi(p1);
-
-		p1 = ++p2;
-		while (*p2 != '.')
-			p2++;
-		*p2 = NULLCHAR;
-		kt->kernel_version[1] = atoi(p1);
-
-		p1 = ++p2;
-		while ((*p2 >= '0') && (*p2 <= '9'))
-			p2++;
-		*p2 = NULLCHAR;
-		kt->kernel_version[2] = atoi(p1);
+	if ((string = pc->read_vmcoreinfo("OSRELEASE"))) {
+		parse_kernel_version(string);
 		free(string);
 	}
 	return THIS_KERNEL_VERSION;
@@ -378,6 +357,9 @@ static void riscv64_get_va_range(struct machine_specific *ms)
 	} else
 		goto error;
 
+	if ((kt->flags2 & KASLR) && (kt->flags & RELOC_SET))
+		ms->kernel_link_addr += (kt->relocate * -1);
+
 	/*
 	 * From Linux 5.13, the kernel mapping is moved to the last 2GB
 	 * of the address space, modules use the 2GB memory range right
@@ -416,6 +398,28 @@ static void riscv64_get_va_range(struct machine_specific *ms)
 	return;
 error:
 	error(FATAL, "cannot get vm layout\n");
+}
+
+static void
+riscv64_get_va_kernel_pa_offset(struct machine_specific *ms)
+{
+	unsigned long kernel_version = riscv64_get_kernel_version();
+
+	/*
+	 * Since Linux v6.4 phys_base is not the physical start of the kernel,
+	 * trying to use "va_kernel_pa_offset" to determine the offset between
+	 * kernel virtual and physical addresses.
+	 */
+	if (kernel_version >= LINUX(6,4,0)) {
+		char *string;
+		if ((string = pc->read_vmcoreinfo("NUMBER(va_kernel_pa_offset)"))) {
+			ms->va_kernel_pa_offset = htol(string, QUIET, NULL);
+			free(string);
+		} else
+			error(FATAL, "cannot read va_kernel_pa_offset\n");
+	}
+	else
+		ms->va_kernel_pa_offset = ms->kernel_link_addr - ms->phys_base;
 }
 
 static int
@@ -1339,6 +1343,14 @@ riscv64_init(int when)
 
 		machdep->verify_paddr = generic_verify_paddr;
 		machdep->ptrs_per_pgd = PTRS_PER_PGD;
+
+		/*
+		 * Even if CONFIG_RANDOMIZE_BASE is not configured,
+		 * derive_kaslr_offset() should work and set
+		 * kt->relocate to 0
+		 */
+		if (!kt->relocate && !(kt->flags2 & (RELOC_AUTO|KASLR)))
+			kt->flags2 |= (RELOC_AUTO|KASLR);
 		break;
 
 	case PRE_GDB:
@@ -1352,6 +1364,7 @@ riscv64_init(int when)
 		riscv64_get_struct_page_size(machdep->machspec);
 		riscv64_get_va_bits(machdep->machspec);
 		riscv64_get_va_range(machdep->machspec);
+		riscv64_get_va_kernel_pa_offset(machdep->machspec);
 
 		pt_level_alloc(&machdep->pgd, "cannot malloc pgd space.");
 		pt_level_alloc(&machdep->machspec->p4d, "cannot malloc p4d space.");

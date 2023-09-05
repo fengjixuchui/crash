@@ -352,6 +352,7 @@ task_init(void)
 		MEMBER_OFFSET_INIT(upid_ns, "upid", "ns"); 
 		MEMBER_OFFSET_INIT(upid_pid_chain, "upid", "pid_chain");
 		MEMBER_OFFSET_INIT(pid_numbers, "pid", "numbers");
+		ARRAY_LENGTH_INIT(len, pid_numbers, "pid.numbers", NULL, 0);
 		MEMBER_OFFSET_INIT(pid_tasks, "pid", "tasks");
 		tt->init_pid_ns = symbol_value("init_pid_ns");
 	}
@@ -675,6 +676,9 @@ task_init(void)
 		tt->this_task = pid_to_task(active_pid);
 	}
 	else {
+		if (INVALID_SIZE(note_buf))
+			STRUCT_SIZE_INIT(note_buf, "note_buf_t");
+
 		if (KDUMP_DUMPFILE())
 			map_cpus_to_prstatus();
 		else if (ELF_NOTES_VALID() && DISKDUMP_DUMPFILE())
@@ -2571,6 +2575,7 @@ refresh_xarray_task_table(void)
 	char *tp;
 	struct list_pair xp;
 	char *pidbuf;
+	long pid_size = SIZE(pid);
 
 	if (DUMPFILE() && (tt->flags & TASK_INIT_DONE))   /* impossible */
 		return;
@@ -2600,8 +2605,12 @@ refresh_xarray_task_table(void)
 	if (CRASHDEBUG(1))
 		console("xarray: count: %ld\n", count);
 
+	/* 6.5: b69f0aeb0689 changed pid.numbers[1] to numbers[] */
+	if (ARRAY_LENGTH(pid_numbers) == 0)
+		pid_size += SIZE(upid);
+
 	retries = 0;
-	pidbuf = GETBUF(SIZE(pid));
+	pidbuf = GETBUF(pid_size);
 
 retry_xarray:
 	if (retries && DUMPFILE())
@@ -2669,7 +2678,7 @@ retry_xarray:
 		 *  - get task from address of task->pids[0]
 		 */
 		if (!readmem(next, KVADDR, pidbuf,
-		    SIZE(pid), "pid", RETURN_ON_ERROR|QUIET)) {
+		    pid_size, "pid", RETURN_ON_ERROR|QUIET)) {
 			error(INFO, "\ncannot read pid struct from xarray\n");
 			if (DUMPFILE())
 				continue;
@@ -6627,39 +6636,42 @@ cmd_foreach(void)
 		    STREQ(args[optind], "NE") ||
 		    STREQ(args[optind], "SW")) {
 
+			ulong state = TASK_STATE_UNINITIALIZED;
+
 			if (fd->flags & FOREACH_STATE)
 				error(FATAL, "only one task state allowed\n");
 
 			if (STREQ(args[optind], "RU"))
-				fd->state = _RUNNING_;
+				state = _RUNNING_;
 			else if (STREQ(args[optind], "IN"))
-				fd->state = _INTERRUPTIBLE_;
+				state = _INTERRUPTIBLE_;
 			else if (STREQ(args[optind], "UN"))
-				fd->state = _UNINTERRUPTIBLE_;
+				state = _UNINTERRUPTIBLE_;
 			else if (STREQ(args[optind], "ST"))
-				fd->state = _STOPPED_;
+				state = _STOPPED_;
 			else if (STREQ(args[optind], "TR"))
-				fd->state = _TRACING_STOPPED_;
+				state = _TRACING_STOPPED_;
 			else if (STREQ(args[optind], "ZO"))
-				fd->state = _ZOMBIE_;
+				state = _ZOMBIE_;
 			else if (STREQ(args[optind], "DE"))
-				fd->state = _DEAD_;
+				state = _DEAD_;
 			else if (STREQ(args[optind], "SW"))
-				fd->state = _SWAPPING_;
+				state = _SWAPPING_;
 			else if (STREQ(args[optind], "PA"))
-				fd->state = _PARKED_;
+				state = _PARKED_;
 			else if (STREQ(args[optind], "WA"))
-				fd->state = _WAKING_;
+				state = _WAKING_;
 			else if (STREQ(args[optind], "ID"))
-				fd->state = _UNINTERRUPTIBLE_|_NOLOAD_;
+				state = _UNINTERRUPTIBLE_|_NOLOAD_;
 			else if (STREQ(args[optind], "NE"))
-				fd->state = _NEW_;
+				state = _NEW_;
 
-			if (fd->state == TASK_STATE_UNINITIALIZED)
+			if (state == TASK_STATE_UNINITIALIZED)
 				error(FATAL, 
 				    "invalid task state for this kernel: %s\n",
 					args[optind]);
 
+			fd->state = args[optind];
 			fd->flags |= FOREACH_STATE;
 
 			optind++;
@@ -7030,26 +7042,9 @@ foreach(struct foreach_data *fd)
 		if ((fd->flags & FOREACH_KERNEL) && !is_kernel_thread(tc->task))
 			continue;
 
-		if (fd->flags & FOREACH_STATE) {
-			if (fd->state == _RUNNING_) {
-				if (task_state(tc->task) != _RUNNING_)
-					continue;
-			} else if (fd->state & _UNINTERRUPTIBLE_) {
-				if (!(task_state(tc->task) & _UNINTERRUPTIBLE_))
-					continue;
-
-				if (valid_task_state(_NOLOAD_)) {
-					if (fd->state & _NOLOAD_) {
-						if (!(task_state(tc->task) & _NOLOAD_))
-							continue;
-					} else {
-						if ((task_state(tc->task) & _NOLOAD_))
-							continue;
-					}
-				}
-			} else if (!(task_state(tc->task) & fd->state))
-				continue;
-		}
+		if ((fd->flags & FOREACH_STATE) &&
+		    (!STRNEQ(task_state_string(tc->task, buf, 0), fd->state)))
+			continue;
 
 		if (specified) {
 			for (j = 0; j < fd->tasks; j++) {
@@ -7878,6 +7873,7 @@ dump_task_table(int verbose)
 	fprintf(fp, "       init_pid_ns: %lx\n", tt->init_pid_ns);
 	fprintf(fp, "         filepages: %ld\n", tt->filepages);
 	fprintf(fp, "         anonpages: %ld\n", tt->anonpages);
+	fprintf(fp, "        shmempages: %ld\n", tt->shmempages);
 	fprintf(fp, "   stack_end_magic: %lx\n", tt->stack_end_magic);
 	fprintf(fp, "        pf_kthread: %lx ", tt->pf_kthread);
 	switch (tt->pf_kthread) 

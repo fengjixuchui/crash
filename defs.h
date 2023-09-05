@@ -675,6 +675,8 @@ struct new_utsname {
 #define IRQ_DESC_TREE_RADIX        (0x40ULL)
 #define IRQ_DESC_TREE_XARRAY       (0x80ULL)
 #define KMOD_PAX                  (0x100ULL)
+#define KMOD_MEMORY               (0x200ULL)
+#define IRQ_DESC_TREE_MAPLE       (0x400ULL)
 
 #define XEN()       (kt->flags & ARCH_XEN)
 #define OPENVZ()    (kt->flags & ARCH_OPENVZ)
@@ -682,6 +684,7 @@ struct new_utsname {
 #define PVOPS_XEN() (kt->flags & ARCH_PVOPS_XEN)
 
 #define PAX_MODULE_SPLIT() (kt->flags2 & KMOD_PAX)
+#define MODULE_MEMORY()    (kt->flags2 & KMOD_MEMORY)
 
 #define XEN_MACHINE_TO_MFN(m)    ((ulonglong)(m) >> PAGESHIFT())
 #define XEN_PFN_TO_PSEUDO(p)     ((ulonglong)(p) << PAGESHIFT())
@@ -884,6 +887,7 @@ struct task_table {                      /* kernel/local task table data */
 	int callbacks;
 	struct task_context **context_by_task; /* task_context sorted by task addr */
 	ulong pid_xarray;
+	long shmempages;
 };
 
 #define TASK_INIT_DONE       (0x1)
@@ -1200,7 +1204,7 @@ struct foreach_data {
 		char *pattern;
 		regex_t regex;
 	} regex_info[MAX_REGEX_ARGS];
-	ulong state;
+	const char *state;
 	char *reference;
 	int keys;
 	int pids;
@@ -2217,6 +2221,10 @@ struct offset_table {                    /* stash of commonly-used offsets */
 	long kset_kobj;
 	long subsys_private_subsys;
 	long vmap_area_purge_list;
+	long module_mem;
+	long module_memory_base;
+	long module_memory_size;
+	long irq_data_irq;
 };
 
 struct size_table {         /* stash of commonly-used sizes */
@@ -2390,6 +2398,7 @@ struct size_table {         /* stash of commonly-used sizes */
 	long percpu_counter;
 	long maple_tree;
 	long maple_node;
+	long module_memory;
 };
 
 struct array_table {
@@ -2424,6 +2433,7 @@ struct array_table {
 	int task_struct_rlim;
 	int signal_struct_rlim;
 	int vm_numa_stat;
+	int pid_numbers;
 };
 
 /*
@@ -2619,6 +2629,8 @@ struct vm_table {                /* kernel VM-related data */
 		char *name;
 	} *pageflags_data;
 	ulong max_mem_section_nr;
+	ulong zero_paddr;
+	ulong huge_zero_paddr;
 };
 
 #define NODES                       (0x1)
@@ -2651,7 +2663,6 @@ struct vm_table {                /* kernel VM-related data */
 #define SLAB_OVERLOAD_PAGE    (0x8000000)
 #define SLAB_CPU_CACHE       (0x10000000)
 #define SLAB_ROOT_CACHES     (0x20000000)
-#define FREELIST_PTR_BSWAP   (0x40000000)
 
 #define IS_FLATMEM()		(vt->flags & FLATMEM)
 #define IS_DISCONTIGMEM()	(vt->flags & DISCONTIGMEM)
@@ -2920,6 +2931,23 @@ struct mod_section_data {
         ulong size;
         int priority;
         int flags;
+	ulong addr;
+};
+
+/* Emulate enum mod_mem_type in include/linux/module.h */
+#define MOD_TEXT		(0)
+#define MOD_DATA		(1)
+#define MOD_RODATA		(2)
+#define MOD_RO_AFTER_INIT	(3)
+#define MOD_INIT_TEXT		(4)
+#define MOD_INIT_DATA		(5)
+#define MOD_INIT_RODATA		(6)
+#define MOD_MEM_NUM_TYPES	(7)
+#define MOD_INVALID		(-1)
+
+struct module_memory {
+	ulong base;
+	uint size;
 };
 
 struct load_module {
@@ -2955,18 +2983,28 @@ struct load_module {
 	ulong mod_percpu;
 	ulong mod_percpu_size;
 	struct objfile *loaded_objfile;
+
+	/* For 6.4 module_memory */
+	struct module_memory mem[MOD_MEM_NUM_TYPES];
+	struct syment **symtable;
+	struct syment **symend;
+	struct syment *ext_symtable[MOD_MEM_NUM_TYPES];
+	struct syment *ext_symend[MOD_MEM_NUM_TYPES];
+	struct syment *load_symtable[MOD_MEM_NUM_TYPES];
+	struct syment *load_symend[MOD_MEM_NUM_TYPES];
 };
 
-#define IN_MODULE(A,L) \
- (((ulong)(A) >= (L)->mod_base) && ((ulong)(A) < ((L)->mod_base+(L)->mod_size)))
-
-#define IN_MODULE_INIT(A,L) \
- (((ulong)(A) >= (L)->mod_init_module_ptr) && ((ulong)(A) < ((L)->mod_init_module_ptr+(L)->mod_init_size)))
-
+#define IN_MODULE(A,L)		(in_module_range(A, L, MOD_TEXT, MOD_RO_AFTER_INIT) != MOD_INVALID)
+#define IN_MODULE_INIT(A,L)	(in_module_range(A, L, MOD_INIT_TEXT, MOD_INIT_RODATA) != MOD_INVALID)
+#define IN_MODULE_TEXT(A,L)	(in_module_range(A, L, MOD_TEXT, MOD_TEXT) == MOD_TEXT || \
+				in_module_range(A, L, MOD_INIT_TEXT, MOD_INIT_TEXT) == MOD_INIT_TEXT)
 #define IN_MODULE_PERCPU(A,L) \
  (((ulong)(A) >= (L)->mod_percpu) && ((ulong)(A) < ((L)->mod_percpu+(L)->mod_percpu_size)))
 
 #define MODULE_PERCPU_SYMS_LOADED(L) ((L)->mod_percpu && (L)->mod_percpu_size)
+
+#define for_each_mod_mem_type(type) \
+	for ((type) = MOD_TEXT; (type) < MOD_MEM_NUM_TYPES; (type)++)
 
 #ifndef GDB_COMMON
 
@@ -2999,6 +3037,9 @@ struct load_module {
 #define PAGEOFFSET(X) (((ulong)(X)) & machdep->pageoffset)
 #define VIRTPAGEBASE(X)  (((ulong)(X)) & (ulong)machdep->pagemask)
 #define PHYSPAGEBASE(X)  (((physaddr_t)(X)) & (physaddr_t)machdep->pagemask)
+
+#define IS_ZEROPAGE(paddr)   ((paddr) == vt->zero_paddr || \
+			      (paddr) == vt->huge_zero_paddr)
 
 /* 
  * Sparse memory stuff
@@ -3621,8 +3662,7 @@ typedef signed int s32;
 	ulong _X = X;									\
 	(THIS_KERNEL_VERSION >= LINUX(5,13,0) &&					\
 		(_X) >= machdep->machspec->kernel_link_addr) ?				\
-		(((unsigned long)(_X)-(machdep->machspec->kernel_link_addr)) +		\
-		 machdep->machspec->phys_base):						\
+		((unsigned long)(_X)-(machdep->machspec->va_kernel_pa_offset)): 	\
 		(((unsigned long)(_X)-(machdep->kvbase)) +				\
 		 machdep->machspec->phys_base);						\
 	})
@@ -5514,7 +5554,7 @@ uint32_t swap32(uint32_t, int);
 uint64_t swap64(uint64_t, int);
 ulong *get_cpumask_buf(void);
 int make_cpumask(char *, ulong *, int, int *);
-size_t strlcpy(char *, char *, size_t);
+size_t strlcpy(char *, const char *, size_t) __attribute__ ((__weak__));
 struct rb_node *rb_first(struct rb_root *);
 struct rb_node *rb_parent(struct rb_node *, struct rb_node *);
 struct rb_node *rb_right(struct rb_node *, struct rb_node *);
@@ -5583,6 +5623,7 @@ void dump_struct_member(char *, ulong, unsigned);
 void dump_union(char *, ulong, unsigned);
 void store_module_symbols_v1(ulong, int);
 void store_module_symbols_v2(ulong, int);
+void store_module_symbols_6_4(ulong, int);
 int is_datatype_command(void);
 int is_typedef(char *);
 int arg_to_datatype(char *, struct datatype_member *, ulong);
@@ -5990,6 +6031,8 @@ void clone_bt_info(struct bt_info *, struct bt_info *, struct task_context *);
 void dump_kernel_table(int);
 void dump_bt_info(struct bt_info *, char *where);
 void dump_log(int);
+void parse_kernel_version(char *);
+
 #define LOG_LEVEL(v) ((v) & 0x07)
 #define SHOW_LOG_LEVEL (0x1)
 #define SHOW_LOG_DICT  (0x2)
@@ -6355,8 +6398,28 @@ typedef struct __attribute__((__packed__)) {
         unsigned int sp_reg:4;
         unsigned int bp_reg:4;
         unsigned int type:2;
+        unsigned int signal:1;
         unsigned int end:1;
 } kernel_orc_entry;
+
+typedef struct __attribute__((__packed__)) {
+        signed short sp_offset;
+        signed short bp_offset;
+        unsigned int sp_reg:4;
+        unsigned int bp_reg:4;
+        unsigned int type:3;
+        unsigned int signal:1;
+} kernel_orc_entry_6_4;
+
+typedef struct orc_entry {
+        signed short sp_offset;
+        signed short bp_offset;
+        unsigned int sp_reg;
+        unsigned int bp_reg;
+        unsigned int type;
+        unsigned int signal;
+        unsigned int end;
+} orc_entry;
 
 struct ORC_data {
 	int module_ORC;
@@ -6368,10 +6431,13 @@ struct ORC_data {
 	ulong orc_lookup;
 	ulong ip_entry;
 	ulong orc_entry;
-	kernel_orc_entry kernel_orc_entry;
+	orc_entry orc_entry_data;
+	int has_signal;
+	int has_end;
 };
 
-#define ORC_TYPE_CALL                   0
+#define ORC_TYPE_CALL                   ((machdep->flags & ORC_6_4) ? 2 : 0)
+/* The below entries are not used and must be updated if we use them. */
 #define ORC_TYPE_REGS                   1
 #define ORC_TYPE_REGS_IRET              2
 #define UNWIND_HINT_TYPE_SAVE           3
@@ -6448,6 +6514,7 @@ struct machine_specific {
 #define ORC         (0x4000)
 #define KPTI        (0x8000)
 #define L1TF       (0x10000)
+#define ORC_6_4    (0x20000)
 
 #define VM_FLAGS (VM_ORIG|VM_2_6_11|VM_XEN|VM_XEN_RHEL4|VM_5LEVEL)
 
@@ -6955,6 +7022,7 @@ struct machine_specific {
 	ulong modules_vaddr;
 	ulong modules_end;
 	ulong kernel_link_addr;
+	ulong va_kernel_pa_offset;
 
 	ulong _page_present;
 	ulong _page_read;
@@ -7113,6 +7181,7 @@ int dumpfile_is_split(void);
 void show_split_dumpfiles(void);
 void x86_process_elf_notes(void *, unsigned long);
 void *diskdump_get_prstatus_percpu(int);
+int have_crash_notes(int cpu);
 void map_cpus_to_prstatus_kdump_cmprs(void);
 void diskdump_display_regs(int, FILE *);
 void process_elf32_notes(void *, ulong);

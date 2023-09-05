@@ -104,6 +104,38 @@ static void check_vmcoreinfo(void);
 static int is_pvops_xen(void);
 static int get_linux_banner_from_vmlinux(char *, size_t);
 
+/*
+ * popuplate the global kernel table (kt) with kernel version
+ * information parsed from UTSNAME/OSRELEASE string
+ */
+void
+parse_kernel_version(char *str)
+{
+	char *p1, *p2, separator;
+
+	p1 = p2 = str;
+	while (*p2 != '.' && *p2 != '\0')
+		p2++;
+
+	*p2 = NULLCHAR;
+	kt->kernel_version[0] = atoi(p1);
+	p1 = ++p2;
+	while (*p2 != '.' && *p2 != '-' && *p2 != '\0')
+		p2++;
+
+	separator = *p2;
+	*p2 = NULLCHAR;
+	kt->kernel_version[1] = atoi(p1);
+
+	if (separator == '.') {
+		p1 = ++p2;
+		while ((*p2 >= '0') && (*p2 <= '9'))
+			p2++;
+
+		*p2 = NULLCHAR;
+		kt->kernel_version[2] = atoi(p1);
+	}
+}
 
 /*
  *  Gather a few kernel basics.
@@ -112,7 +144,7 @@ void
 kernel_init()
 {
 	int i, c;
-	char *p1, *p2, buf[BUFSIZE];
+	char buf[BUFSIZE];
 	struct syment *sp1, *sp2;
 	char *rqstruct;
 	char *rq_timestamp_name = NULL;
@@ -270,28 +302,7 @@ kernel_init()
 	if (buf[64])
 		buf[64] = NULLCHAR;
 	if (ascii_string(kt->utsname.release)) {
-		char separator;
-
-		p1 = p2 = buf;
-		while (*p2 != '.')
-			p2++;
-		*p2 = NULLCHAR;
-		kt->kernel_version[0] = atoi(p1);
-		p1 = ++p2;
-		while (*p2 != '.' && *p2 != '-' && *p2 != '\0')
-			p2++;
-		separator = *p2;
-		*p2 = NULLCHAR;
-		kt->kernel_version[1] = atoi(p1);
-		*p2 = separator;
-		if (*p2 == '.') {
-			p1 = ++p2;
-			while ((*p2 >= '0') && (*p2 <= '9'))
-				p2++;
-			*p2 = NULLCHAR;
-			kt->kernel_version[2] = atoi(p1);
-		} else
-			kt->kernel_version[2] = 0;
+		parse_kernel_version(buf);
 
 		if (CRASHDEBUG(1))
 			fprintf(fp, "base kernel version: %d.%d.%d\n",
@@ -541,7 +552,10 @@ kernel_init()
 	MEMBER_OFFSET_INIT(irqaction_dev_id, "irqaction", "dev_id");
 	MEMBER_OFFSET_INIT(irqaction_next, "irqaction", "next");
 
-	if (kernel_symbol_exists("irq_desc_tree")) {
+	/* 6.5 and later: CONFIG_SPARSE_IRQ */
+	if (kernel_symbol_exists("sparse_irqs"))
+		kt->flags2 |= IRQ_DESC_TREE_MAPLE;
+	else if (kernel_symbol_exists("irq_desc_tree")) {
 		get_symbol_type("irq_desc_tree", NULL, &req);
 		if (STREQ(req.type_tag_name, "xarray")) {
 			kt->flags2 |= IRQ_DESC_TREE_XARRAY;
@@ -554,6 +568,7 @@ kernel_init()
 	}
 	STRUCT_SIZE_INIT(irq_data, "irq_data");
 	if (VALID_STRUCT(irq_data)) {
+		MEMBER_OFFSET_INIT(irq_data_irq, "irq_data", "irq");
 		MEMBER_OFFSET_INIT(irq_data_chip, "irq_data", "chip");
 		MEMBER_OFFSET_INIT(irq_data_affinity, "irq_data", "affinity");
 		MEMBER_OFFSET_INIT(irq_desc_irq_data, "irq_desc", "irq_data");
@@ -1371,8 +1386,6 @@ verify_namelist()
 				buffer3[i++] = *p1++;
 			buffer3[i] = NULLCHAR;
 		}
-
-		break;
         }
         pclose(pipe);
 
@@ -3571,7 +3584,21 @@ module_init(void)
         	MEMBER_OFFSET_INIT(module_num_gpl_syms, "module", 
 			"num_gpl_syms");
 
-		if (MEMBER_EXISTS("module", "module_core")) {
+		if (MEMBER_EXISTS("module", "mem")) {	/* 6.4 and later */
+			kt->flags2 |= KMOD_MEMORY;	/* MODULE_MEMORY() can be used. */
+
+			MEMBER_OFFSET_INIT(module_mem, "module", "mem");
+			MEMBER_OFFSET_INIT(module_memory_base, "module_memory", "base");
+			MEMBER_OFFSET_INIT(module_memory_size, "module_memory", "size");
+			STRUCT_SIZE_INIT(module_memory, "module_memory");
+
+			if (CRASHDEBUG(1))
+				error(INFO, "struct module_memory detected.\n");
+
+			if (get_array_length("module.mem", NULL, 0) != MOD_MEM_NUM_TYPES)
+				error(WARNING, "module memory types have changed!\n");
+
+		} else if (MEMBER_EXISTS("module", "module_core")) {
 			MEMBER_OFFSET_INIT(module_core_size, "module",
 					   "core_size");
 			MEMBER_OFFSET_INIT(module_init_size, "module",
@@ -3757,6 +3784,8 @@ module_init(void)
 		total += nsyms;
 		total += 2;  /* store the module's start/ending addresses */
 		total += 2;  /* and the init start/ending addresses */
+		if (MODULE_MEMORY()) /* 7 regions at most -> 14, so needs +10 */
+			total += 10;
 
 		/*
 		 *  If the module has kallsyms, set up to grab them as well.
@@ -3784,7 +3813,11 @@ module_init(void)
 		case KALLSYMS_V2:
 			if (THIS_KERNEL_VERSION >= LINUX(2,6,27)) {
 				numksyms = UINT(modbuf + OFFSET(module_num_symtab));
-				size = UINT(modbuf + MODULE_OFFSET2(module_core_size, rx));
+				if (MODULE_MEMORY())
+					/* check mem[MOD_TEXT].size only */
+					size = UINT(modbuf + OFFSET(module_mem) + OFFSET(module_memory_size));
+				else
+					size = UINT(modbuf + MODULE_OFFSET2(module_core_size, rx));
 			} else {
 				numksyms = ULONG(modbuf + OFFSET(module_num_symtab));
 				size = ULONG(modbuf + MODULE_OFFSET2(module_core_size, rx));
@@ -3822,7 +3855,10 @@ module_init(void)
 		store_module_symbols_v1(total, kt->mods_installed);
 		break;
 	case KMOD_V2:
-		store_module_symbols_v2(total, kt->mods_installed);
+		if (MODULE_MEMORY())
+			store_module_symbols_6_4(total, kt->mods_installed);
+		else
+			store_module_symbols_v2(total, kt->mods_installed);
 		break;
 	}
 
@@ -3836,7 +3872,7 @@ module_init(void)
 static int
 verify_modules(void)
 {
-	int i;
+	int i, t;
 	int found, irregularities;
         ulong mod, mod_next, mod_base;
 	long mod_size;
@@ -3893,8 +3929,13 @@ verify_modules(void)
 				mod_base = mod;
 				break;
 			case KMOD_V2:
-				mod_base = ULONG(modbuf + 
-					MODULE_OFFSET2(module_module_core, rx));
+				if (MODULE_MEMORY())
+					/* mem[MOD_TEXT].base */
+					mod_base = ULONG(modbuf + OFFSET(module_mem) +
+							OFFSET(module_memory_base));
+				else
+					mod_base = ULONG(modbuf +
+						MODULE_OFFSET2(module_module_core, rx));
 				break;
 			}
 
@@ -3916,7 +3957,17 @@ verify_modules(void)
 				case KMOD_V2:
         				module_name = modbuf + 
 						OFFSET(module_name);
-					if (THIS_KERNEL_VERSION >= LINUX(2,6,27))
+					if (MODULE_MEMORY()) {
+						mod_size = 0;
+						for_each_mod_mem_type(t) {
+							if (t == MOD_INIT_TEXT)
+								break;
+
+							mod_size += UINT(modbuf + OFFSET(module_mem) +
+									SIZE(module_memory) * t +
+									OFFSET(module_memory_size));
+						}
+					} else if (THIS_KERNEL_VERSION >= LINUX(2,6,27))
 						mod_size = UINT(modbuf +
 							MODULE_OFFSET2(module_core_size, rx));
 					else
@@ -4536,7 +4587,7 @@ do_module_cmd(ulong flag, char *modref, ulong address,
 				"MODULE"),
 				mkstring(buf2, maxnamelen, LJUST, "NAME"),
 				mkstring(buf4, VADDR_PRLEN, CENTER|LJUST,
-				"BASE"),
+				MODULE_MEMORY() ? "TEXT_BASE" : "BASE"),
 				mkstring(buf3, maxsizelen, RJUST, "SIZE"));
 		}
 	
@@ -6142,8 +6193,12 @@ dump_kernel_table(int verbose)
 		fprintf(fp, "%sIRQ_DESC_TREE_RADIX", others++ ? "|" : "");
 	if (kt->flags2 & IRQ_DESC_TREE_XARRAY)
 		fprintf(fp, "%sIRQ_DESC_TREE_XARRAY", others++ ? "|" : "");
+	if (kt->flags2 & IRQ_DESC_TREE_MAPLE)
+		fprintf(fp, "%sIRQ_DESC_TREE_MAPLE", others++ ? "|" : "");
 	if (kt->flags2 & KMOD_PAX)
 		fprintf(fp, "%sKMOD_PAX", others++ ? "|" : "");
+	if (kt->flags2 & KMOD_MEMORY)
+		fprintf(fp, "%sKMOD_MEMORY", others++ ? "|" : "");
 	fprintf(fp, ")\n");
 
         fprintf(fp, "         stext: %lx\n", kt->stext);
@@ -6612,6 +6667,45 @@ get_irq_desc_addr(int irq)
 		readmem(ptr, KVADDR, &addr,
                         sizeof(void *), "irq_desc_ptrs entry",
                         FAULT_ON_ERROR);
+	} else if (kt->flags2 & IRQ_DESC_TREE_MAPLE) {
+		unsigned int i;
+
+		if (kt->highest_irq && (irq > kt->highest_irq))
+			return addr;
+
+		cnt = do_maple_tree(symbol_value("sparse_irqs"), MAPLE_TREE_COUNT, NULL);
+
+		len = sizeof(struct list_pair) * (cnt+1);
+		lp = (struct list_pair *)GETBUF(len);
+		lp[0].index = cnt; /* maxcount */
+
+		cnt = do_maple_tree(symbol_value("sparse_irqs"), MAPLE_TREE_GATHER, lp);
+
+		/*
+		 * NOTE: We cannot use lp.index like Radix Tree or XArray because
+		 * it's not an absolute index and just counter in Maple Tree.
+		 */
+		if (kt->highest_irq == 0) {
+			readmem((ulong)lp[cnt-1].value +
+					OFFSET(irq_desc_irq_data) + OFFSET(irq_data_irq),
+				KVADDR, &kt->highest_irq, sizeof(int), "irq_data.irq",
+				FAULT_ON_ERROR);
+		}
+
+		for (c = 0; c < cnt; c++) {
+			readmem((ulong)lp[c].value +
+					OFFSET(irq_desc_irq_data) + OFFSET(irq_data_irq),
+				KVADDR, &i, sizeof(int), "irq_data.irq", FAULT_ON_ERROR);
+			if (i == irq) {
+				if (CRASHDEBUG(1))
+					fprintf(fp, "index: %d value: %lx\n",
+						i, (ulong)lp[c].value);
+				addr = (ulong)lp[c].value;
+				break;
+			}
+		}
+		FREEBUF(lp);
+
 	} else if (kt->flags2 & (IRQ_DESC_TREE_RADIX|IRQ_DESC_TREE_XARRAY)) {
 		if (kt->highest_irq && (irq > kt->highest_irq))
 			return addr;
@@ -6660,8 +6754,8 @@ get_irq_desc_addr(int irq)
 		FREEBUF(lp);
 	} else {
 		error(FATAL,
-		    "neither irq_desc, _irq_desc, irq_desc_ptrs "
-		    "or irq_desc_tree symbols exist\n");
+		    "neither irq_desc, _irq_desc, irq_desc_ptrs, "
+		    "irq_desc_tree or sparse_irqs symbols exist\n");
 	}
 
 	return addr;
@@ -7258,7 +7352,8 @@ generic_get_irq_affinity(int irq)
 		tmp_addr = irq_desc_addr + \
 			   OFFSET(irq_desc_t_affinity);
 
-	if (symbol_exists("alloc_cpumask_var")) /* pointer member */
+	if (symbol_exists("alloc_cpumask_var_node") ||
+	    symbol_exists("alloc_cpumask_var")) /* pointer member */
 		readmem(tmp_addr,KVADDR, &affinity_ptr, sizeof(ulong),
 		        "irq_desc affinity", FAULT_ON_ERROR);
 	else /* array member */
@@ -10889,8 +10984,6 @@ void
 get_log_from_vmcoreinfo(char *file)
 {
 	char *string;
-	char buf[BUFSIZE];
-	char *p1, *p2;
 	struct vmcoreinfo_data *vmc = &kt->vmcoreinfo;
 
 	if (!(pc->flags2 & VMCOREINFO))
@@ -10902,22 +10995,8 @@ get_log_from_vmcoreinfo(char *file)
 	if ((string = pc->read_vmcoreinfo("OSRELEASE"))) {
 		if (CRASHDEBUG(1))
 			fprintf(fp, "OSRELEASE: %s\n", string);
-		strcpy(buf, string);
-		p1 = p2 = buf;
-		while (*p2 != '.')
-			p2++;
-		*p2 = NULLCHAR;
-		kt->kernel_version[0] = atoi(p1);
-		p1 = ++p2;
-		while (*p2 != '.')
-			p2++;
-		*p2 = NULLCHAR;
-		kt->kernel_version[1] = atoi(p1);
-		p1 = ++p2;
-		while ((*p2 >= '0') && (*p2 <= '9'))
-			p2++;
-		*p2 = NULLCHAR;
-		kt->kernel_version[2] = atoi(p1);
+
+		parse_kernel_version(string);
 
 		if (CRASHDEBUG(1))
 			fprintf(fp, "base kernel version: %d.%d.%d\n",
@@ -11807,8 +11886,13 @@ int get_linux_banner_from_vmlinux(char *buf, size_t size)
 {
 	struct bfd_section *sect;
 	long offset;
+	ulong start_rodata;
 
-	if (!kernel_symbol_exists(".rodata"))
+	if (kernel_symbol_exists(".rodata"))
+		start_rodata = symbol_value(".rodata");
+	else if (kernel_symbol_exists("__start_rodata"))
+		start_rodata = symbol_value("__start_rodata");
+	else
 		return FALSE;
 
 	sect = bfd_get_section_by_name(st->bfd, ".rodata");
@@ -11821,7 +11905,7 @@ int get_linux_banner_from_vmlinux(char *buf, size_t size)
 	 * value in vmlinux file, but relative offset to linux_banner
 	 * object in .rodata section is idential.
 	 */
-	offset = symbol_value("linux_banner") - symbol_value(".rodata");
+	offset = symbol_value("linux_banner") - start_rodata;
 
 	if (!bfd_get_section_contents(st->bfd,
 				      sect,

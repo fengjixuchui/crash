@@ -287,7 +287,7 @@ static void do_mt_entry(ulong entry, ulong min, ulong max, uint depth,
 	static struct req_entry **e = NULL;
 	struct tree_data *td = ops->is_td ? (struct tree_data *)ops->private : NULL;
 
-	if (ops->entry)
+	if (ops->entry && entry)
 		ops->entry(entry, entry, path, max, ops->private);
 
 	if (!td)
@@ -313,7 +313,7 @@ static void do_mt_entry(ulong entry, ulong min, ulong max, uint depth,
 		fprintf(fp, "  index: %ld  position: %s/%u\n",
 			++(*global_index), path, index);
 
-	if (td->structname) {
+	if (td->structname && entry) {
 		if (td->flags & TREE_STRUCT_RADIX_10)
 			print_radix = 10;
 		else if (td->flags & TREE_STRUCT_RADIX_16)
