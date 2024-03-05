@@ -3342,6 +3342,13 @@ x86_64_print_stack_entry(struct bt_info *bt, FILE *ofp, int level,
 
 	bt->call_target = name;
 
+	/*
+	 * The caller check below does not work correctly for some kernels,
+	 * so skip it if ORC unwinder is available.
+	 */
+	if (machdep->flags & ORC)
+		return result;
+
 	if (is_direct_call_target(bt)) {
 		if (CRASHDEBUG(2))
 			fprintf(ofp, "< enable BT_CHECK_CALLER for %s >\n", 
@@ -8649,7 +8656,7 @@ x86_64_get_framesize(struct bt_info *bt, ulong textaddr, ulong rsp, char *stack_
 				if (CRASHDEBUG(1))
 					fprintf(fp, "rsp: %lx prev_sp: %lx framesize: %d\n",
 							rsp, prev_sp, framesize);
-			} else if ((korc->sp_reg == ORC_REG_BP) && bt->bptr) {
+			} else if ((korc->sp_reg == ORC_REG_BP) && bt->bptr && INSTACK(bt->bptr, bt)) {
 				prev_sp = bt->bptr + korc->sp_offset;
 				framesize = (prev_sp - (rsp + 8) - 8);
 				if (CRASHDEBUG(1))

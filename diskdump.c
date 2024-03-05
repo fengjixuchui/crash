@@ -27,6 +27,7 @@
 #include "diskdump.h"
 #include "xen_dom0.h"
 #include "vmcore.h"
+#include "maple_tree.h"
 
 #define BITMAP_SECT_LEN	4096
 
@@ -142,13 +143,23 @@ int have_crash_notes(int cpu)
 	return TRUE;
 }
 
+int
+diskdump_is_cpu_prstatus_valid(int cpu)
+{
+	static int crash_notes_exists = -1;
+
+	if (crash_notes_exists == -1)
+		crash_notes_exists = kernel_symbol_exists("crash_notes");
+
+	return (!crash_notes_exists || have_crash_notes(cpu));
+}
+
 void
 map_cpus_to_prstatus_kdump_cmprs(void)
 {
 	void **nt_ptr;
 	int online, i, j, nrcpus;
 	size_t size;
-	int crash_notes_exists;
 
 	if (pc->flags2 & QEMU_MEM_DUMP_COMPRESSED)  /* notes exist for all cpus */
 		goto resize_note_pointers;
@@ -171,10 +182,9 @@ map_cpus_to_prstatus_kdump_cmprs(void)
 	 *  Re-populate the array with the notes mapping to online cpus
 	 */
 	nrcpus = (kt->kernel_NR_CPUS ? kt->kernel_NR_CPUS : NR_CPUS);
-	crash_notes_exists = kernel_symbol_exists("crash_notes");
 
 	for (i = 0, j = 0; i < nrcpus; i++) {
-		if (in_cpu_map(ONLINE_MAP, i) && (!crash_notes_exists || have_crash_notes(i))) {
+		if (in_cpu_map(ONLINE_MAP, i) && machdep->is_cpu_prstatus_valid(i)) {
 			dd->nt_prstatus_percpu[i] = nt_ptr[j++];
 			dd->num_prstatus_notes = 
 				MAX(dd->num_prstatus_notes, i+1);
@@ -674,6 +684,9 @@ restart:
 	else if (STRNEQ(header->utsname.machine, "riscv64") &&
 	    machine_type_mismatch(file, "RISCV64", NULL, 0))
 		goto err;
+	else if (STRNEQ(header->utsname.machine, "loongarch64") &&
+		machine_type_mismatch(file, "LOONGARCH64", NULL, 0))
+		goto err;
 
 	if (header->block_size != block_size) {
 		block_size = header->block_size;
@@ -834,6 +847,8 @@ restart:
 		dd->machine_type = EM_SPARCV9;
 	else if (machine_type("RISCV64"))
 		dd->machine_type = EM_RISCV;
+	else if (machine_type("LOONGARCH64"))
+		dd->machine_type = EM_LOONGARCH;
 	else {
 		error(INFO, "%s: unsupported machine type: %s\n", 
 			DISKDUMP_VALID() ? "diskdump" : "compressed kdump",
@@ -1076,6 +1091,7 @@ diskdump_init(char *unused, FILE *fptr)
 	if (!DISKDUMP_VALID() && !KDUMP_CMPRS_VALID())
 		return FALSE;
 
+	machdep->is_cpu_prstatus_valid = diskdump_is_cpu_prstatus_valid;
 	dd->ofp = fptr;
 	return TRUE;
 }
@@ -1594,6 +1610,12 @@ get_diskdump_regs_riscv64(struct bt_info *bt, ulong *eip, ulong *esp)
 }
 
 static void
+get_diskdump_regs_loongarch64(struct bt_info *bt, ulong *eip, ulong *esp)
+{
+	machdep->get_stack_frame(bt, eip, esp);
+}
+
+static void
 get_diskdump_regs_sparc64(struct bt_info *bt, ulong *eip, ulong *esp)
 {
 	Elf64_Nhdr *note;
@@ -1674,6 +1696,10 @@ get_diskdump_regs(struct bt_info *bt, ulong *eip, ulong *esp)
 
 	case EM_RISCV:
 		get_diskdump_regs_riscv64(bt, eip, esp);
+		break;
+
+	case EM_LOONGARCH:
+		get_diskdump_regs_loongarch64(bt, eip, esp);
 		break;
 
 	default:
@@ -1823,7 +1849,7 @@ dump_note_offsets(FILE *fp)
 			if (machine_type("X86_64") || machine_type("S390X") ||
 			    machine_type("ARM64") || machine_type("PPC64") ||
 			    machine_type("SPARC64") || machine_type("MIPS64") ||
-			    machine_type("RISCV64")) {
+			    machine_type("RISCV64") || machine_type("LOONGARCH64")) {
 				note64 = (void *)dd->notes_buf + tot;
 				len = sizeof(Elf64_Nhdr);
 				if (STRNEQ((char *)note64 + len, "QEMU"))
@@ -1934,6 +1960,8 @@ __diskdump_memory_dump(FILE *fp)
 		fprintf(fp, "(EM_AARCH64)\n"); break;
 	case EM_SPARCV9:
 		fprintf(fp, "(EM_SPARCV9)\n"); break;
+	case EM_LOONGARCH:
+		fprintf(fp, "(EM_LOONGARCH)\n"); break;
 	default:
 		fprintf(fp, "(unknown)\n"); break;
 	}
@@ -2620,6 +2648,9 @@ diskdump_display_regs(int cpu, FILE *ofp)
 
 	if (machine_type("MIPS64"))
 		mips64_display_regs_from_elf_notes(cpu, ofp);
+
+	if (machine_type("LOONGARCH64"))
+		loongarch64_display_regs_from_elf_notes(cpu, ofp);
 }
 
 void
@@ -2631,7 +2662,7 @@ dump_registers_for_compressed_kdump(void)
 	    !(machine_type("X86") || machine_type("X86_64") ||
 	      machine_type("ARM64") || machine_type("PPC64") ||
 	      machine_type("MIPS") || machine_type("MIPS64") ||
-	      machine_type("RISCV64")))
+	      machine_type("RISCV64") || machine_type("LOONGARCH64")))
 		error(FATAL, "-r option not supported for this dumpfile\n");
 
 	if (machine_type("ARM64") && (kt->cpus != dd->num_prstatus_notes))
@@ -2745,15 +2776,42 @@ diskdump_device_dump_info(FILE *ofp)
 	}
 }
 
+static ulong ZRAM_FLAG_SHIFT;
+static ulong ZRAM_FLAG_SAME_BIT;
+static ulong ZRAM_COMP_PRIORITY_BIT1;
+static ulong ZRAM_COMP_PRIORITY_MASK;
+
 static void
 zram_init(void)
 {
-	MEMBER_OFFSET_INIT(zram_mempoll, "zram", "mem_pool");
+	long zram_flag_shift;
+
+	MEMBER_OFFSET_INIT(zram_mem_pool, "zram", "mem_pool");
 	MEMBER_OFFSET_INIT(zram_compressor, "zram", "compressor");
-	MEMBER_OFFSET_INIT(zram_table_flag, "zram_table_entry", "flags");
-	if (INVALID_MEMBER(zram_table_flag))
-		MEMBER_OFFSET_INIT(zram_table_flag, "zram_table_entry", "value");
+	if (INVALID_MEMBER(zram_compressor))
+		MEMBER_OFFSET_INIT(zram_comp_algs, "zram", "comp_algs");
+	MEMBER_OFFSET_INIT(zram_table_entry_flags, "zram_table_entry", "flags");
+	if (INVALID_MEMBER(zram_table_entry_flags))
+		MEMBER_OFFSET_INIT(zram_table_entry_flags, "zram_table_entry", "value");
 	STRUCT_SIZE_INIT(zram_table_entry, "zram_table_entry");
+	MEMBER_OFFSET_INIT(zs_pool_size_class, "zs_pool", "size_class");
+	MEMBER_OFFSET_INIT(size_class_size, "size_class", "size");
+	MEMBER_OFFSET_INIT(zspage_huge, "zspage", "huge");
+
+	if (enumerator_value("ZRAM_LOCK", &zram_flag_shift))
+		;
+	else if (THIS_KERNEL_VERSION >= LINUX(6,1,0))
+		zram_flag_shift = PAGESHIFT() + 1;
+	else
+		zram_flag_shift = 24;
+
+	ZRAM_FLAG_SHIFT = 1 << zram_flag_shift;
+	ZRAM_FLAG_SAME_BIT = 1 << (zram_flag_shift+1);
+	ZRAM_COMP_PRIORITY_BIT1 = ZRAM_FLAG_SHIFT + 7;
+	ZRAM_COMP_PRIORITY_MASK = 0x3;
+
+	if (CRASHDEBUG(1))
+		fprintf(fp, "zram_flag_shift: %ld\n", zram_flag_shift);
 }
 
 static unsigned char *
@@ -2761,9 +2819,11 @@ zram_object_addr(ulong pool, ulong handle, unsigned char *zram_buf)
 {
 	ulong obj, off, class, page, zspage;
 	struct zspage zspage_s;
+	struct zspage_5_17 zspage_5_17_s;
 	physaddr_t paddr;
 	unsigned int obj_idx, class_idx, size;
 	ulong pages[2], sizes[2];
+	ulong zs_magic;
 
 	readmem(handle, KVADDR, &obj, sizeof(void *), "zram entry", FAULT_ON_ERROR);
 	obj >>= OBJ_TAG_BITS;
@@ -2772,13 +2832,22 @@ zram_object_addr(ulong pool, ulong handle, unsigned char *zram_buf)
 
 	readmem(page + OFFSET(page_private), KVADDR, &zspage,
 			sizeof(void *), "page_private", FAULT_ON_ERROR);
-	readmem(zspage, KVADDR, &zspage_s, sizeof(struct zspage), "zspage", FAULT_ON_ERROR);
 
-	class_idx = zspage_s.class;
-	if (zspage_s.magic != ZSPAGE_MAGIC)
-		error(FATAL, "zspage magic incorrect: %x\n", zspage_s.magic);
+	if (VALID_MEMBER(zspage_huge)) {
+		readmem(zspage, KVADDR, &zspage_5_17_s,
+			sizeof(struct zspage_5_17), "zspage_5_17", FAULT_ON_ERROR);
+		class_idx = zspage_5_17_s.class;
+		zs_magic = zspage_5_17_s.magic;
+	} else {
+		readmem(zspage, KVADDR, &zspage_s, sizeof(struct zspage), "zspage", FAULT_ON_ERROR);
+		class_idx = zspage_s.class;
+		zs_magic = zspage_s.magic;
+	}
 
-	class = pool + OFFSET(zspoll_size_class);
+	if (zs_magic != ZSPAGE_MAGIC)
+		error(FATAL, "zspage magic incorrect: %x\n", zs_magic);
+
+	class = pool + OFFSET(zs_pool_size_class);
 	class += (class_idx * sizeof(void *));
 	readmem(class, KVADDR, &class, sizeof(void *), "size_class", FAULT_ON_ERROR);
 	readmem(class + OFFSET(size_class_size), KVADDR,
@@ -2794,8 +2863,13 @@ zram_object_addr(ulong pool, ulong handle, unsigned char *zram_buf)
 	}
 
 	pages[0] = page;
-	readmem(page + OFFSET(page_freelist), KVADDR, &pages[1],
+	if (VALID_MEMBER(page_freelist))
+		readmem(page + OFFSET(page_freelist), KVADDR, &pages[1],
 			sizeof(void *), "page_freelist", FAULT_ON_ERROR);
+	else
+		readmem(page + OFFSET(page_index), KVADDR, &pages[1],
+			sizeof(void *), "page_index", FAULT_ON_ERROR);
+
 	sizes[0] = PAGESIZE() - off;
 	sizes[1] = size - sizes[0];
 	if (!is_page_ptr(pages[0], &paddr)) {
@@ -2812,19 +2886,28 @@ zram_object_addr(ulong pool, ulong handle, unsigned char *zram_buf)
 	readmem(paddr, PHYSADDR, zram_buf + sizes[0], sizes[1], "zram buffer[1]", FAULT_ON_ERROR);
 
 out:
-	readmem(page, KVADDR, &obj, sizeof(void *), "page flags", FAULT_ON_ERROR);
-	if (!(obj & (1<<10))) { //PG_OwnerPriv1 flag
-		return (zram_buf + ZS_HANDLE_SIZE);
+	if (VALID_MEMBER(zspage_huge)) {
+		if (!zspage_5_17_s.huge)
+			return (zram_buf + ZS_HANDLE_SIZE);
+	} else {
+		readmem(page, KVADDR, &obj, sizeof(void *), "page flags", FAULT_ON_ERROR);
+		if (!(obj & (1<<10))) // PG_OwnerPriv1 flag
+			return (zram_buf + ZS_HANDLE_SIZE);
 	}
 
 	return zram_buf;
+}
+
+static inline bool radix_tree_exceptional_entry(ulong entry)
+{
+	return entry & RADIX_TREE_EXCEPTIONAL_ENTRY;
 }
 
 static unsigned char *
 lookup_swap_cache(ulonglong pte_val, unsigned char *zram_buf)
 {
 	ulonglong swp_offset;
-	ulong swp_type, swp_space, page;
+	ulong swp_type, swp_space;
 	struct list_pair lp;
 	physaddr_t paddr;
 	static int is_xarray = -1;
@@ -2850,10 +2933,13 @@ lookup_swap_cache(ulonglong pte_val, unsigned char *zram_buf)
 	swp_space += (swp_offset >> SWAP_ADDRESS_SPACE_SHIFT) * SIZE(address_space);
 
 	lp.index = swp_offset;
-	if ((is_xarray ? do_xarray : do_radix_tree)(swp_space, RADIX_TREE_SEARCH, &lp)) {
-		readmem((ulong)lp.value, KVADDR, &page, sizeof(void *),
-				"swap_cache page", FAULT_ON_ERROR);
-		if (!is_page_ptr(page, &paddr)) {
+	if ((is_xarray ? do_xarray : do_radix_tree)
+		(swp_space+OFFSET(address_space_page_tree), RADIX_TREE_SEARCH, &lp)) {
+		if ((is_xarray ? xa_is_value : radix_tree_exceptional_entry)((ulong)lp.value)) {
+			/* ignore shadow values */
+			return NULL;
+		}
+		if (!is_page_ptr((ulong)lp.value, &paddr)) {
 			error(WARNING, "radix page: %lx: not a page pointer\n", lp.value);
 			return NULL;
 		}
@@ -2930,9 +3016,9 @@ try_zram_decompress(ulonglong pte_val, unsigned char *buf, ulong len, ulonglong 
 	ulong zram, zram_table_entry, sector, index, entry, flags, size,
 		outsize, off;
 
-	if (INVALID_MEMBER(zram_compressor)) {
+	if (INVALID_MEMBER(zram_mem_pool)) {
 		zram_init();
-		if (INVALID_MEMBER(zram_compressor)) {
+		if (INVALID_MEMBER(zram_mem_pool)) {
 			error(WARNING,
 			      "Some pages are swapped out to zram. "
 			      "Please run mod -s zram.\n");
@@ -2946,8 +3032,28 @@ try_zram_decompress(ulonglong pte_val, unsigned char *buf, ulong len, ulonglong 
 	if (!get_disk_name_private_data(pte_val, vaddr, NULL, &zram))
 		return 0;
 
-	readmem(zram + OFFSET(zram_compressor), KVADDR, name,
-		sizeof(name), "zram compressor", FAULT_ON_ERROR);
+	if (THIS_KERNEL_VERSION >= LINUX(2, 6, 0))
+		swp_offset = (ulonglong)__swp_offset(pte_val);
+	else
+		swp_offset = (ulonglong)SWP_OFFSET(pte_val);
+
+	sector = swp_offset << (PAGESHIFT() - 9);
+	index = sector >> SECTORS_PER_PAGE_SHIFT;
+	readmem(zram, KVADDR, &zram_table_entry,
+		sizeof(void *), "zram_table_entry", FAULT_ON_ERROR);
+	zram_table_entry += (index * SIZE(zram_table_entry));
+	readmem(zram_table_entry + OFFSET(zram_table_entry_flags), KVADDR, &flags,
+		sizeof(void *), "zram_table_entry.flags", FAULT_ON_ERROR);
+	if (VALID_MEMBER(zram_compressor))
+		readmem(zram + OFFSET(zram_compressor), KVADDR, name, sizeof(name),
+			"zram compressor", FAULT_ON_ERROR);
+	else {
+		ulong comp_alg_addr;
+		uint32_t prio = (flags >> ZRAM_COMP_PRIORITY_BIT1) & ZRAM_COMP_PRIORITY_MASK;
+		readmem(zram + OFFSET(zram_comp_algs) + sizeof(const char *) * prio, KVADDR,
+			&comp_alg_addr, sizeof(comp_alg_addr), "zram comp_algs", FAULT_ON_ERROR);
+		read_string(comp_alg_addr, name, sizeof(name));
+	}
 	if (STREQ(name, "lzo")) {
 #ifdef LZO
 		if (!(dd->flags & LZO_SUPPORTED)) {
@@ -2968,12 +3074,6 @@ try_zram_decompress(ulonglong pte_val, unsigned char *buf, ulong len, ulonglong 
 		return 0;
 	}
 
-	if (THIS_KERNEL_VERSION >= LINUX(2, 6, 0)) {
-		swp_offset = (ulonglong)__swp_offset(pte_val);
-	} else {
-		swp_offset = (ulonglong)SWP_OFFSET(pte_val);
-	}
-
 	zram_buf = (unsigned char *)GETBUF(PAGESIZE());
 	/* lookup page from swap cache */
 	off = PAGEOFFSET(vaddr);
@@ -2983,17 +3083,16 @@ try_zram_decompress(ulonglong pte_val, unsigned char *buf, ulong len, ulonglong 
 		goto out;
 	}
 
-	sector = swp_offset << (PAGESHIFT() - 9);
-	index = sector >> SECTORS_PER_PAGE_SHIFT;
-	readmem(zram, KVADDR, &zram_table_entry,
-		sizeof(void *), "zram_table_entry", FAULT_ON_ERROR);
-	zram_table_entry += (index * SIZE(zram_table_entry));
 	readmem(zram_table_entry, KVADDR, &entry,
 		sizeof(void *), "entry of table", FAULT_ON_ERROR);
-	readmem(zram_table_entry + OFFSET(zram_table_flag), KVADDR, &flags,
-		sizeof(void *), "zram_table_flag", FAULT_ON_ERROR);
 	if (!entry || (flags & ZRAM_FLAG_SAME_BIT)) {
-		memset(buf, entry, len);
+		int count;
+		ulong *same_buf = (ulong *)GETBUF(PAGESIZE());
+		for (count = 0; count < PAGESIZE() / sizeof(ulong); count++) {
+			same_buf[count] = entry;
+		}
+		memcpy(buf, same_buf + off, len);
+		FREEBUF(same_buf);
 		goto out;
 	}
 	size = flags & (ZRAM_FLAG_SHIFT -1);
@@ -3002,8 +3101,8 @@ try_zram_decompress(ulonglong pte_val, unsigned char *buf, ulong len, ulonglong 
 		goto out;
 	}
 
-	readmem(zram + OFFSET(zram_mempoll), KVADDR, &zram,
-		sizeof(void *), "zram_mempoll", FAULT_ON_ERROR);
+	readmem(zram + OFFSET(zram_mem_pool), KVADDR, &zram,
+		sizeof(void *), "zram.mem_pool", FAULT_ON_ERROR);
 
 	obj_addr = zram_object_addr(zram, entry, zram_buf);
 	if (obj_addr == NULL) {

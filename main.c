@@ -228,7 +228,8 @@ main(int argc, char **argv)
 			} else if (STREQ(long_options[option_index].name, "kaslr")) {
 				if (!machine_type("X86_64") &&
 				    !machine_type("ARM64") && !machine_type("X86") &&
-				    !machine_type("S390X") && !machine_type("RISCV64"))
+				    !machine_type("S390X") && !machine_type("RISCV64") &&
++				    !machine_type("LOONGARCH64"))
 					error(INFO, "--kaslr not valid "
 						"with this machine type.\n");
 				else if (STREQ(optarg, "auto"))
@@ -1043,7 +1044,8 @@ is_external_command(void)
             STREQ(cmd, "more") ||
             STREQ(cmd, "less") ||
 	    STREQ(cmd, "echo") ||
-            STREQ(cmd, "ls")) {
+	    STREQ(cmd, "ls") ||
+	    STREQ(cmd, "clear")) {
                 sprintf(command, "%s", cmd);
                 for (i = 1; i < argcnt; i++) {
                         strcat(command, " ");
